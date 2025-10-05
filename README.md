@@ -1,6 +1,6 @@
 ﻿# EchoSphere Chat Server
 
-EchoSphere is a lightweight Go + Vanilla JS stack that gives you a Discord-style workspace: email/password auth, persistent SQLite storage, multi-server + multi-channel text chat, and live message streaming over Server-Sent Events (SSE).
+EchoSphere is a lightweight Go + Vanilla JS stack that gives you a Discord-style workspace: email/password auth, persistent SQLite storage, multi-server + multi-channel text chat, and live message streaming over WebSockets.
 
 ## Current Features
 
@@ -10,20 +10,20 @@ EchoSphere is a lightweight Go + Vanilla JS stack that gives you a Discord-style
 - Multi-server / multi-channel text chat with channel unread indicators
 - `/api/channels/{id}/messages` REST endpoint (GET history / POST new message)
 - `/api/servers/{id}/members` endpoint for member lists, `/api/bootstrap` for initial state hydration
-- `/events` SSE stream pushes new channel messages in real time
-- Modern single-page experience (no frameworks) with responsive layout
+- `/ws` WebSocket endpoint delivers realtime channel events (subscribe/send)
+- Modern single-page experience (no frameworks) with responsive layout and offline-friendly fallbacks
 
 ## Project Layout
 
 ```
 .
-├── main.go                 # HTTP server, auth, routing, SSE wiring, API handlers
+├── main.go                 # HTTP server, auth, routing, REST controllers
 ├── storage.go              # Schema setup + data access helpers for users/servers/channels/messages
-├── events.go               # SSE broker fan-outs chat events to connected clients
+├── ws.go                  # WebSocket hub, client management, realtime broadcasting
 ├── go.mod / go.sum         # Module definition and dependencies
 └── web
     ├── static
-    │   ├── app.js          # Frontend logic, state management, SSE hookup, UI rendering
+    │   ├── app.js          # Frontend logic, state management, WebSocket hookup, UI rendering
     │   └── styles.css      # Responsive, Discord-inspired styling
     └── templates
         ├── app.html        # Authenticated app shell, bootstraps initial data
@@ -58,9 +58,9 @@ EchoSphere is a lightweight Go + Vanilla JS stack that gives you a Discord-style
 | `/api/servers/{id}/members` | GET | List members for the selected server |
 | `/api/channels/{id}/messages` | GET | Fetch recent messages (`?limit=200`) |
 | `/api/channels/{id}/messages` | POST | Send a chat message (JSON: `{ "content": "hello" }`) |
-| `/events` | SSE | Stream real-time message events across every channel you can access |
+| `/ws` | WebSocket | Bidirectional channel for subscribing and sending chat events |
 
-All endpoints expect an authenticated session. SSE pushes payloads of the form:
+All endpoints expect an authenticated session. WebSocket `message` events look like:
 
 ```json
 {
@@ -116,7 +116,7 @@ Option A – build locally then upload:
 ```bash
 GOOS=linux GOARCH=amd64 go build -o echosphere
 scp echosphere -r web echosphere@YOUR_SERVER_IP:/opt/echosphere/
-scp main.go storage.go events.go go.mod go.sum echosphere@YOUR_SERVER_IP:/opt/echosphere/
+scp main.go storage.go ws.go go.mod go.sum echosphere@YOUR_SERVER_IP:/opt/echosphere/
 ```
 
 Option B – build on the server:
@@ -199,12 +199,11 @@ After verifying HTTP, request certificates with Let's Encrypt (`sudo certbot --n
 
 ## Roadmap
 
-Milestone 2–4 are planned next:
+Upcoming milestones:
 
-1. **WebSocket backbone** – replace SSE/REST polling with a bidirectional hub for chat, typing indicators, and upcoming signaling needs.
-2. **Voice rooms (single room)** – introduce WebRTC signaling + an SFU backend to support live audio in the default room.
-3. **Full workspace parity** – multi-room voice, screen sharing, richer presence, and polished moderation controls.
+1. **Voice rooms (single room)** - introduce WebRTC signaling + an SFU backend to support live audio in the default room.
+2. **Full workspace parity** - multi-room voice, screen sharing, richer presence, and polished moderation controls.
 
-Contributions welcome—start by filing an issue or PR for Milestone 2.
+Contributions welcome - feel free to tackle the voice milestone or polish the new WebSocket client.
 
 Happy chatting!

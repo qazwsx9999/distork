@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"html/template"
 	"log"
 	"net/http"
@@ -74,7 +73,7 @@ type bootstrapPayload struct {
 type serverState struct {
 	templates *template.Template
 	db        *sql.DB
-	events    *eventBroker
+	ws        *wsHub
 
 	mu       sync.RWMutex
 	sessions map[string]string // sessionID -> email
@@ -114,7 +113,7 @@ func main() {
 	srv := &serverState{
 		templates: templates,
 		db:        db,
-		events:    newEventBroker(),
+		ws:        newWSHub(),
 		sessions:  make(map[string]string),
 	}
 
@@ -128,7 +127,7 @@ func main() {
 	mux.HandleFunc("/login", srv.handleLogin)
 	mux.HandleFunc("/signup", srv.handleSignup)
 	mux.HandleFunc("/logout", srv.handleLogout)
-	mux.HandleFunc("/events", srv.handleEvents)
+	mux.HandleFunc("/ws", srv.handleWS)
 	mux.HandleFunc("/api/bootstrap", srv.handleBootstrap)
 	mux.Handle("/api/servers/", http.StripPrefix("/api/servers/", http.HandlerFunc(srv.handleServerAPI)))
 	mux.Handle("/api/channels/", http.StripPrefix("/api/channels/", http.HandlerFunc(srv.handleChannelAPI)))
@@ -544,9 +543,10 @@ func (s *serverState) handleChannelMessages(w http.ResponseWriter, r *http.Reque
 			msg.AuthorDisplayName = currentUser.DisplayName
 		}
 
-		s.events.publish(msg)
-
 		dto := toMessageDTO(msg)
+
+		s.broadcastMessage(dto)
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		if err := json.NewEncoder(w).Encode(dto); err != nil {
@@ -694,64 +694,6 @@ func (s *serverState) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
-}
-
-func (s *serverState) handleEvents(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.userFromRequest(r); !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "stream unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
-	clientID, ch := s.events.subscribe()
-	defer s.events.unsubscribe(clientID)
-
-	if _, err := fmt.Fprint(w, ": connected\n\n"); err == nil {
-		flusher.Flush()
-	}
-
-	heartbeat := time.NewTicker(30 * time.Second)
-	defer heartbeat.Stop()
-
-	for {
-		select {
-		case msg, ok := <-ch:
-			if !ok {
-				return
-			}
-
-			payload, err := json.Marshal(toMessageDTO(msg))
-			if err != nil {
-				log.Printf("marshal sse message: %v", err)
-				continue
-			}
-
-			if _, err := fmt.Fprint(w, "event: message\n"); err != nil {
-				return
-			}
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
-				return
-			}
-			flusher.Flush()
-		case <-heartbeat.C:
-			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
-				return
-			}
-			flusher.Flush()
-		case <-r.Context().Done():
-			return
-		}
-	}
 }
 
 func (s *serverState) renderTemplate(w http.ResponseWriter, status int, name string, data templateData) {

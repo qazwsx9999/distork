@@ -1,10 +1,9 @@
 ﻿const appContext = window.APP_CONTEXT || {};
 const state = {
   user: appContext.user || { email: '', displayName: '' },
-  servers: Array.isArray(appContext.servers) ? appContext.servers.map((server) => ({
-    ...server,
-    unread: new Map(),
-  })) : [],
+  servers: Array.isArray(appContext.servers)
+    ? appContext.servers.map((server) => ({ ...server, unread: new Map() }))
+    : [],
   membersByServer: new Map(),
   messagesByChannel: new Map(),
   messageIds: new Set(),
@@ -15,7 +14,10 @@ const state = {
     members: false,
     messages: false,
   },
-  eventSource: null,
+  socket: null,
+  socketReady: false,
+  pendingEvents: [],
+  wsReconnectDelay: 2000,
 };
 
 const refs = {
@@ -63,7 +65,7 @@ function ensureArray(value) {
 
 function ensureServerMap() {
   state.servers.forEach((server) => {
-    if (!(server.channels && Array.isArray(server.channels))) {
+    if (!Array.isArray(server.channels)) {
       server.channels = [];
     }
     if (!(server.unread instanceof Map)) {
@@ -455,6 +457,7 @@ async function switchServer(serverId) {
     ensureMessagesLoaded(state.activeChannelId),
   ]);
 
+  subscribeAllChannels();
   clearUnread(state.activeChannelId, state.activeServerId);
   renderMembers();
   renderMessages();
@@ -535,31 +538,148 @@ async function ensureMessagesLoaded(channelId, { force = false } = {}) {
   }
 }
 
+function sendSocketEvent(event) {
+  const payload = JSON.stringify(event);
+  if (state.socket && state.socketReady && state.socket.readyState === WebSocket.OPEN) {
+    state.socket.send(payload);
+    return true;
+  }
+  state.pendingEvents.push(payload);
+  if (!state.socket || state.socket.readyState === WebSocket.CLOSED) {
+    scheduleReconnect(0);
+  }
+  return false;
+}
+
+function flushPendingEvents() {
+  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return;
+  while (state.pendingEvents.length > 0) {
+    const payload = state.pendingEvents.shift();
+    state.socket.send(payload);
+  }
+}
+
+function subscribeAllChannels() {
+  if (!state.routes.ws) return;
+  const allChannels = [];
+  state.servers.forEach((server) => {
+    (server.channels || []).forEach((channel) => {
+      allChannels.push(channel.id);
+    });
+  });
+  allChannels.forEach((channelId) => {
+    sendSocketEvent({ type: 'subscribe', channelId });
+  });
+}
+
+function handleSocketMessage(event) {
+  try {
+    const data = JSON.parse(event.data);
+    switch (data.type) {
+      case 'message':
+        if (data.message) {
+          pushMessage(data.message);
+        }
+        break;
+      case 'error':
+        if (data.error) {
+          setStatus(data.error, 'error');
+        }
+        break;
+      default:
+        break;
+    }
+  } catch (error) {
+    console.error('parse websocket payload', error);
+  }
+}
+
+function scheduleReconnect(delay) {
+  const timeout = Math.max(delay, state.wsReconnectDelay);
+  if (state.socket && (state.socket.readyState === WebSocket.OPEN || state.socket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  setTimeout(() => {
+    connectSocket();
+    state.wsReconnectDelay = Math.min(state.wsReconnectDelay * 2, 30000);
+  }, timeout);
+}
+
+function connectSocket() {
+  if (!state.routes.ws) return;
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const target = `${protocol}://${window.location.host}${state.routes.ws}`;
+
+  try {
+    if (state.socket) {
+      state.socket.close();
+    }
+  } catch (error) {
+    // ignore
+  }
+
+  const socket = new WebSocket(target);
+  state.socket = socket;
+  setStatus('Connecting…', 'pending');
+
+  socket.addEventListener('open', () => {
+    state.socketReady = true;
+    state.wsReconnectDelay = 2000;
+    setStatus('');
+    subscribeAllChannels();
+    flushPendingEvents();
+  });
+
+  socket.addEventListener('message', handleSocketMessage);
+
+  socket.addEventListener('close', () => {
+    state.socketReady = false;
+    setStatus('Connection lost. Reconnecting…', 'error');
+    scheduleReconnect(state.wsReconnectDelay);
+  });
+
+  socket.addEventListener('error', () => {
+    socket.close();
+  });
+}
+
 async function handleSubmit(event) {
   event.preventDefault();
   if (!refs.composerInput || state.loading.messages) return;
   const content = refs.composerInput.value.trim();
   if (!content) return;
 
-  setStatus('Sending…', 'pending');
+  const sent = sendSocketEvent({
+    type: 'message',
+    channelId: state.activeChannelId,
+    content,
+  });
 
-  try {
-    const payload = await fetchJSON(`${state.routes.channels}/${state.activeChannelId}/messages`, {
-      method: 'POST',
-      body: JSON.stringify({ content }),
-    });
-
-    pushMessage(payload, { scroll: true });
+  if (sent) {
     refs.composerInput.value = '';
     refs.composerInput.style.height = 'auto';
     setStatus('');
-  } catch (error) {
-    console.error('send message', error);
-    setStatus('Failed to send message.', 'error');
+  } else {
+    // fallback to HTTP if the socket is down
+    setStatus('Sending…', 'pending');
+    try {
+      const payload = await fetchJSON(`${state.routes.channels}/${state.activeChannelId}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ content }),
+      });
+      pushMessage(payload, { scroll: true });
+      refs.composerInput.value = '';
+      refs.composerInput.style.height = 'auto';
+      setStatus('');
+    } catch (error) {
+      console.error('send message fallback', error);
+      setStatus('Failed to send message.', 'error');
+    }
   }
 }
 
 function pushMessage(msg, { scroll = false } = {}) {
+  if (!msg || typeof msg.id === 'undefined') return;
   const key = `${msg.channelId}:${msg.id}`;
   if (state.messageIds.has(key)) return;
   state.messageIds.add(key);
@@ -568,53 +688,19 @@ function pushMessage(msg, { scroll = false } = {}) {
   bucket.push(msg);
   bucket.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 
+  const server = state.servers.find((srv) => (srv.channels || []).some((ch) => ch.id === msg.channelId));
   if (msg.channelId === state.activeChannelId) {
     renderMessages();
     if (scroll) scrollToBottom(true);
-  } else {
-    const channel = findServer(state.activeServerId)?.channels.find((ch) => ch.id === msg.channelId);
-    addUnread(msg.channelId, channel ? channel.serverId : state.activeServerId);
+  } else if (server) {
+    addUnread(msg.channelId, server.id);
   }
-}
-
-function connectEvents() {
-  if (!state.routes.events) return;
-  if (state.eventSource) {
-    state.eventSource.close();
-  }
-
-  setStatus('Connecting…', 'pending');
-
-  const es = new EventSource(state.routes.events, { withCredentials: true });
-  state.eventSource = es;
-
-  es.addEventListener('open', () => {
-    setStatus('');
-  });
-
-  es.addEventListener('message', (event) => {
-    try {
-      const payload = JSON.parse(event.data);
-      pushMessage(payload);
-    } catch (error) {
-      console.error('parse event payload', error);
-    }
-  });
-
-  es.addEventListener('error', () => {
-    setStatus('Connection lost. Reconnecting…', 'error');
-    es.close();
-    setTimeout(connectEvents, 3000);
-  });
 }
 
 async function bootstrapLatest() {
   try {
     const payload = await fetchJSON(state.routes.bootstrap);
-    state.servers = payload.servers.map((server) => ({
-      ...server,
-      unread: new Map(),
-    }));
+    state.servers = payload.servers.map((server) => ({ ...server, unread: new Map() }));
     state.activeServerId = payload.activeServerId;
     state.activeChannelId = payload.activeChannelId;
     state.membersByServer = new Map([[payload.activeServerId, payload.members || []]]);
@@ -627,12 +713,14 @@ async function bootstrapLatest() {
       state.messageIds.add(key);
       ensureChannelBuffer(msg.channelId).push(msg);
     });
+
     renderServers();
     renderChannels();
     renderMembers();
     renderMessages();
     updateBreadcrumb();
     updateComposerPlaceholder();
+    subscribeAllChannels();
   } catch (error) {
     console.error('bootstrap refresh', error);
   }
@@ -663,18 +751,21 @@ async function init() {
   renderMessages();
   updateBreadcrumb();
   updateComposerPlaceholder();
-  connectEvents();
+  connectSocket();
   setStatus('');
 
-  // Refresh bootstrap data after load to catch any updates.
   setTimeout(() => {
     bootstrapLatest();
   }, 2000);
 }
 
 window.addEventListener('beforeunload', () => {
-  if (state.eventSource) {
-    state.eventSource.close();
+  if (state.socket) {
+    try {
+      state.socket.close();
+    } catch (error) {
+      // ignore
+    }
   }
 });
 
