@@ -29,25 +29,47 @@ type user struct {
 	CreatedAt    time.Time
 }
 
+type templateData map[string]any
+
 type messageDTO struct {
 	ID                int64     `json:"id"`
+	ChannelID         int64     `json:"channelId"`
 	AuthorEmail       string    `json:"authorEmail"`
 	AuthorDisplayName string    `json:"authorDisplayName"`
 	Content           string    `json:"content"`
 	CreatedAt         time.Time `json:"createdAt"`
 }
 
-func toMessageDTO(msg chatMessage) messageDTO {
-	return messageDTO{
-		ID:                msg.ID,
-		AuthorEmail:       msg.AuthorEmail,
-		AuthorDisplayName: msg.AuthorDisplayName,
-		Content:           msg.Content,
-		CreatedAt:         msg.CreatedAt,
-	}
+type userDTO struct {
+	Email       string `json:"email"`
+	DisplayName string `json:"displayName"`
 }
 
-type templateData map[string]any
+type channelPayload struct {
+	ID        int64     `json:"id"`
+	ServerID  int64     `json:"serverId"`
+	Slug      string    `json:"slug"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"createdAt"`
+	Type      string    `json:"type"`
+}
+
+type serverPayload struct {
+	ID        int64            `json:"id"`
+	Slug      string           `json:"slug"`
+	Name      string           `json:"name"`
+	CreatedAt time.Time        `json:"createdAt"`
+	Channels  []channelPayload `json:"channels"`
+}
+
+type bootstrapPayload struct {
+	User            userDTO         `json:"user"`
+	Servers         []serverPayload `json:"servers"`
+	ActiveServerID  int64           `json:"activeServerId"`
+	ActiveChannelID int64           `json:"activeChannelId"`
+	Members         []memberInfo    `json:"members"`
+	Messages        []messageDTO    `json:"messages"`
+}
 
 type serverState struct {
 	templates *template.Template
@@ -56,6 +78,9 @@ type serverState struct {
 
 	mu       sync.RWMutex
 	sessions map[string]string // sessionID -> email
+
+	defaultServerID  int64
+	defaultChannelID int64
 }
 
 const sessionCookieName = "echosphere_session"
@@ -93,6 +118,10 @@ func main() {
 		sessions:  make(map[string]string),
 	}
 
+	if err := srv.ensureDefaultWorkspace(ctx); err != nil {
+		log.Fatalf("ensure default workspace: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir(filepath.Join("web", "static")))))
 	mux.HandleFunc("/", srv.handleIndex)
@@ -100,7 +129,9 @@ func main() {
 	mux.HandleFunc("/signup", srv.handleSignup)
 	mux.HandleFunc("/logout", srv.handleLogout)
 	mux.HandleFunc("/events", srv.handleEvents)
-	mux.HandleFunc("/api/messages", srv.handleMessages)
+	mux.HandleFunc("/api/bootstrap", srv.handleBootstrap)
+	mux.Handle("/api/servers/", http.StripPrefix("/api/servers/", http.HandlerFunc(srv.handleServerAPI)))
+	mux.Handle("/api/channels/", http.StripPrefix("/api/channels/", http.HandlerFunc(srv.handleChannelAPI)))
 
 	addr := ":" + envOrDefault("PORT", "8080")
 	defer func() {
@@ -116,6 +147,17 @@ func main() {
 	}
 }
 
+func toMessageDTO(msg chatMessage) messageDTO {
+	return messageDTO{
+		ID:                msg.ID,
+		ChannelID:         msg.ChannelID,
+		AuthorEmail:       msg.AuthorEmail,
+		AuthorDisplayName: msg.AuthorDisplayName,
+		Content:           msg.Content,
+		CreatedAt:         msg.CreatedAt,
+	}
+}
+
 func (s *serverState) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -128,28 +170,392 @@ func (s *serverState) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.ensureMembership(r.Context(), currentUser.Email); err != nil {
+		log.Printf("ensure membership: %v", err)
+	}
+
+	payload, err := s.buildBootstrapPayload(r.Context(), currentUser)
+	if err != nil {
+		log.Printf("bootstrap payload: %v", err)
+		http.Error(w, "failed to load workspace", http.StatusInternalServerError)
+		return
+	}
+
+	serversJSON := template.JS("[]")
+	if raw, err := json.Marshal(payload.Servers); err == nil {
+		serversJSON = template.JS(raw)
+	}
+
+	membersJSON := template.JS("[]")
+	if raw, err := json.Marshal(payload.Members); err == nil {
+		membersJSON = template.JS(raw)
+	}
+
 	messagesJSON := template.JS("[]")
-	if messages, err := s.recentMessages(r.Context(), 100); err != nil {
-		log.Printf("load messages: %v", err)
-	} else {
+	if raw, err := json.Marshal(payload.Messages); err == nil {
+		messagesJSON = template.JS(raw)
+	}
+
+	data := templateData{
+		"Username":        currentUser.Email,
+		"DisplayName":     currentUser.DisplayName,
+		"ServersJSON":     serversJSON,
+		"MembersJSON":     membersJSON,
+		"MessagesJSON":    messagesJSON,
+		"ActiveServerID":  payload.ActiveServerID,
+		"ActiveChannelID": payload.ActiveChannelID,
+	}
+
+	s.renderTemplate(w, http.StatusOK, "app", data)
+}
+
+func (s *serverState) buildBootstrapPayload(ctx context.Context, currentUser user) (bootstrapPayload, error) {
+	servers, err := s.serversForUser(ctx, currentUser.Email)
+	if err != nil {
+		return bootstrapPayload{}, err
+	}
+
+	if len(servers) == 0 {
+		if err := s.ensureMembership(ctx, currentUser.Email); err != nil {
+			return bootstrapPayload{}, err
+		}
+		servers, err = s.serversForUser(ctx, currentUser.Email)
+		if err != nil {
+			return bootstrapPayload{}, err
+		}
+	}
+
+	activeServerID := s.defaultServerID
+	containsActive := false
+	for _, srv := range servers {
+		if srv.ID == activeServerID {
+			containsActive = true
+			break
+		}
+	}
+	if !containsActive && len(servers) > 0 {
+		activeServerID = servers[0].ID
+	}
+
+	var activeChannelID int64
+	serverPayloads := make([]serverPayload, 0, len(servers))
+
+	for _, srv := range servers {
+		channels, err := s.channelsForServer(ctx, srv.ID)
+		if err != nil {
+			return bootstrapPayload{}, err
+		}
+
+		chPayloads := make([]channelPayload, 0, len(channels))
+		for _, ch := range channels {
+			chPayloads = append(chPayloads, channelPayload{
+				ID:        ch.ID,
+				ServerID:  ch.ServerID,
+				Slug:      ch.Slug,
+				Name:      ch.Name,
+				CreatedAt: ch.CreatedAt,
+				Type:      "text",
+			})
+		}
+
+		if len(chPayloads) == 0 {
+			now := time.Now().UTC()
+			res, err := s.db.ExecContext(ctx, `INSERT INTO channels (server_id, slug, name, created_at) VALUES (?, ?, ?, ?)`, srv.ID, "general", "general", now)
+			if err != nil {
+				return bootstrapPayload{}, err
+			}
+			id, err := res.LastInsertId()
+			if err != nil {
+				return bootstrapPayload{}, err
+			}
+			chPayloads = append(chPayloads, channelPayload{ID: id, ServerID: srv.ID, Slug: "general", Name: "general", CreatedAt: now, Type: "text"})
+		}
+
+		if srv.ID == activeServerID {
+			activeChannelID = chPayloads[0].ID
+			if srv.ID == s.defaultServerID {
+				for _, ch := range chPayloads {
+					if ch.ID == s.defaultChannelID {
+						activeChannelID = ch.ID
+						break
+					}
+				}
+			}
+		}
+
+		serverPayloads = append(serverPayloads, serverPayload{
+			ID:        srv.ID,
+			Slug:      srv.Slug,
+			Name:      srv.Name,
+			CreatedAt: srv.CreatedAt,
+			Channels:  chPayloads,
+		})
+	}
+
+	if activeChannelID == 0 && len(serverPayloads) > 0 {
+		activeChannelID = serverPayloads[0].Channels[0].ID
+	}
+
+	members, err := s.membersForServer(ctx, activeServerID)
+	if err != nil {
+		return bootstrapPayload{}, err
+	}
+
+	messages, err := s.recentMessages(ctx, activeChannelID, 100)
+	if err != nil {
+		return bootstrapPayload{}, err
+	}
+
+	msgDTOs := make([]messageDTO, 0, len(messages))
+	for _, msg := range messages {
+		msgDTOs = append(msgDTOs, toMessageDTO(msg))
+	}
+
+	return bootstrapPayload{
+		User: userDTO{
+			Email:       currentUser.Email,
+			DisplayName: currentUser.DisplayName,
+		},
+		Servers:         serverPayloads,
+		ActiveServerID:  activeServerID,
+		ActiveChannelID: activeChannelID,
+		Members:         members,
+		Messages:        msgDTOs,
+	}, nil
+}
+
+func (s *serverState) handleBootstrap(w http.ResponseWriter, r *http.Request) {
+	currentUser, ok := s.userFromRequest(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	payload, err := s.buildBootstrapPayload(r.Context(), currentUser)
+	if err != nil {
+		log.Printf("bootstrap handler: %v", err)
+		http.Error(w, "failed to load data", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("encode bootstrap: %v", err)
+	}
+}
+
+func (s *serverState) handleServerAPI(w http.ResponseWriter, r *http.Request) {
+	currentUser, ok := s.userFromRequest(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	serverID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		http.Error(w, "invalid server id", http.StatusBadRequest)
+		return
+	}
+
+	hasAccess, err := s.userHasServerAccess(r.Context(), currentUser.Email, serverID)
+	if err != nil {
+		log.Printf("check server access: %v", err)
+		http.Error(w, "failed to check permissions", http.StatusInternalServerError)
+		return
+	}
+	if !hasAccess {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if len(parts) == 1 || parts[1] == "" {
+		switch r.Method {
+		case http.MethodGet:
+			channels, err := s.channelsForServer(r.Context(), serverID)
+			if err != nil {
+				log.Printf("list channels: %v", err)
+				http.Error(w, "failed to list channels", http.StatusInternalServerError)
+				return
+			}
+			payload := make([]channelPayload, 0, len(channels))
+			for _, ch := range channels {
+				payload = append(payload, channelPayload{
+					ID:        ch.ID,
+					ServerID:  ch.ServerID,
+					Slug:      ch.Slug,
+					Name:      ch.Name,
+					CreatedAt: ch.CreatedAt,
+					Type:      "text",
+				})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(payload); err != nil {
+				log.Printf("encode channels: %v", err)
+			}
+		default:
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	switch parts[1] {
+	case "members":
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		members, err := s.membersForServer(r.Context(), serverID)
+		if err != nil {
+			log.Printf("list members: %v", err)
+			http.Error(w, "failed to list members", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(members); err != nil {
+			log.Printf("encode members: %v", err)
+		}
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *serverState) handleChannelAPI(w http.ResponseWriter, r *http.Request) {
+	currentUser, ok := s.userFromRequest(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 1 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	channelID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		http.Error(w, "invalid channel id", http.StatusBadRequest)
+		return
+	}
+
+	ch, exists, err := s.channelByID(r.Context(), channelID)
+	if err != nil {
+		log.Printf("load channel: %v", err)
+		http.Error(w, "failed to load channel", http.StatusInternalServerError)
+		return
+	}
+	if !exists {
+		http.NotFound(w, r)
+		return
+	}
+
+	hasAccess, err := s.userHasServerAccess(r.Context(), currentUser.Email, ch.ServerID)
+	if err != nil {
+		log.Printf("check channel access: %v", err)
+		http.Error(w, "failed to verify access", http.StatusInternalServerError)
+		return
+	}
+	if !hasAccess {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if len(parts) < 2 {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch parts[1] {
+	case "messages":
+		s.handleChannelMessages(w, r, channelID, currentUser)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *serverState) handleChannelMessages(w http.ResponseWriter, r *http.Request, channelID int64, currentUser user) {
+	switch r.Method {
+	case http.MethodGet:
+		limit := 50
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				if n > 500 {
+					n = 500
+				}
+				limit = n
+			}
+		}
+
+		messages, err := s.recentMessages(r.Context(), channelID, limit)
+		if err != nil {
+			log.Printf("load messages: %v", err)
+			http.Error(w, "failed to load messages", http.StatusInternalServerError)
+			return
+		}
+
 		payload := make([]messageDTO, 0, len(messages))
 		for _, msg := range messages {
 			payload = append(payload, toMessageDTO(msg))
 		}
-		if raw, err := json.Marshal(payload); err != nil {
-			log.Printf("marshal messages: %v", err)
-		} else {
-			messagesJSON = template.JS(string(raw))
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			log.Printf("encode messages: %v", err)
 		}
-	}
 
-	data := templateData{
-		"Username":     currentUser.Email,
-		"DisplayName":  currentUser.DisplayName,
-		"MessagesJSON": messagesJSON,
-	}
+	case http.MethodPost:
+		defer r.Body.Close()
 
-	s.renderTemplate(w, http.StatusOK, "app", data)
+		var body struct {
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		content := strings.TrimSpace(body.Content)
+		if content == "" {
+			http.Error(w, "message cannot be empty", http.StatusBadRequest)
+			return
+		}
+		if utf8.RuneCountInString(content) > 2000 {
+			http.Error(w, "message too long", http.StatusBadRequest)
+			return
+		}
+
+		msg, err := s.saveMessage(r.Context(), channelID, currentUser.Email, content)
+		if err != nil {
+			log.Printf("save message: %v", err)
+			http.Error(w, "failed to save message", http.StatusInternalServerError)
+			return
+		}
+		if msg.AuthorDisplayName == "" {
+			msg.AuthorDisplayName = currentUser.DisplayName
+		}
+
+		s.events.publish(msg)
+
+		dto := toMessageDTO(msg)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(dto); err != nil {
+			log.Printf("encode message response: %v", err)
+		}
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *serverState) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -179,6 +585,10 @@ func (s *serverState) handleLogin(w http.ResponseWriter, r *http.Request) {
 		if !exists || bcrypt.CompareHashAndPassword(u.PasswordHash, []byte(password)) != nil {
 			s.renderTemplate(w, http.StatusUnauthorized, "login", templateData{"Error": "invalid email or password"})
 			return
+		}
+
+		if err := s.ensureMembership(r.Context(), u.Email); err != nil {
+			log.Printf("ensure membership: %v", err)
 		}
 
 		s.createSession(w, u.Email)
@@ -259,6 +669,33 @@ func (s *serverState) handleSignup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
+
+func (s *serverState) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	cookie, err := r.Cookie(sessionCookieName)
+	if err == nil {
+		s.mu.Lock()
+		delete(s.sessions, cookie.Value)
+		s.mu.Unlock()
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     sessionCookieName,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   false,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
 func (s *serverState) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.userFromRequest(r); !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -315,111 +752,6 @@ func (s *serverState) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-}
-
-func (s *serverState) handleMessages(w http.ResponseWriter, r *http.Request) {
-	currentUser, ok := s.userFromRequest(r)
-	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	switch r.Method {
-	case http.MethodGet:
-		limit := 50
-		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
-				if n > 200 {
-					n = 200
-				}
-				limit = n
-			}
-		}
-
-		messages, err := s.recentMessages(r.Context(), limit)
-		if err != nil {
-			log.Printf("load messages: %v", err)
-			http.Error(w, "failed to load messages", http.StatusInternalServerError)
-			return
-		}
-
-		payload := make([]messageDTO, 0, len(messages))
-		for _, msg := range messages {
-			payload = append(payload, toMessageDTO(msg))
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(payload); err != nil {
-			log.Printf("encode messages: %v", err)
-		}
-	case http.MethodPost:
-		defer r.Body.Close()
-
-		var body struct {
-			Content string `json:"content"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid request body", http.StatusBadRequest)
-			return
-		}
-
-		content := strings.TrimSpace(body.Content)
-		if content == "" {
-			http.Error(w, "message cannot be empty", http.StatusBadRequest)
-			return
-		}
-		if utf8.RuneCountInString(content) > 1000 {
-			http.Error(w, "message too long", http.StatusBadRequest)
-			return
-		}
-
-		msg, err := s.saveMessage(r.Context(), currentUser.Email, content)
-		if err != nil {
-			log.Printf("save message: %v", err)
-			http.Error(w, "failed to save message", http.StatusInternalServerError)
-			return
-		}
-		if msg.AuthorDisplayName == "" {
-			msg.AuthorDisplayName = currentUser.DisplayName
-		}
-
-		s.events.publish(msg)
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		if err := json.NewEncoder(w).Encode(toMessageDTO(msg)); err != nil {
-			log.Printf("encode message response: %v", err)
-		}
-	default:
-		w.Header().Set("Allow", "GET, POST")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func (s *serverState) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	cookie, err := r.Cookie(sessionCookieName)
-	if err == nil {
-		s.mu.Lock()
-		delete(s.sessions, cookie.Value)
-		s.mu.Unlock()
-
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookieName,
-			Value:    "",
-			Path:     "/",
-			MaxAge:   -1,
-			HttpOnly: true,
-			Secure:   false,
-			SameSite: http.SameSiteLaxMode,
-		})
-	}
-
-	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 func (s *serverState) renderTemplate(w http.ResponseWriter, status int, name string, data templateData) {

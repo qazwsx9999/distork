@@ -1,30 +1,32 @@
 ﻿# EchoSphere Chat Server
 
-EchoSphere is a lightweight Go chat stack with session-based authentication, a persistent SQLite datastore, and a browser client that streams messages live over Server-Sent Events (SSE). Users can sign up, log in, and exchange messages in real time.
+EchoSphere is a lightweight Go + Vanilla JS stack that gives you a Discord-style workspace: email/password auth, persistent SQLite storage, multi-server + multi-channel text chat, and live message streaming over Server-Sent Events (SSE).
 
-## Features
+## Current Features
 
-- Email + password signup/login backed by bcrypt hashing
-- Cookie sessions with secure random identifiers
-- SQLite persistence for users and chat history
-- `/api/messages` REST endpoint (GET history, POST new message)
-- `/events` SSE stream for broadcasting new chat messages instantly
-- Single-page frontend (vanilla JS + CSS) packaged under `web/`
+- Email + password signup/login with bcrypt hashing
+- Session cookies with secure random identifiers
+- SQLite persistence for users, servers, channels, memberships, and chat history
+- Multi-server / multi-channel text chat with channel unread indicators
+- `/api/channels/{id}/messages` REST endpoint (GET history / POST new message)
+- `/api/servers/{id}/members` endpoint for member lists, `/api/bootstrap` for initial state hydration
+- `/events` SSE stream pushes new channel messages in real time
+- Modern single-page experience (no frameworks) with responsive layout
 
 ## Project Layout
 
 ```
 .
-├── main.go                 # HTTP server, routing, handlers, SSE wiring
-├── storage.go              # Database schema + access helpers
-├── events.go               # In-memory pub/sub broker for SSE clients
+├── main.go                 # HTTP server, auth, routing, SSE wiring, API handlers
+├── storage.go              # Schema setup + data access helpers for users/servers/channels/messages
+├── events.go               # SSE broker fan-outs chat events to connected clients
 ├── go.mod / go.sum         # Module definition and dependencies
 └── web
     ├── static
-    │   ├── app.js          # Frontend logic, SSE hookup, composer
-    │   └── styles.css      # Chat UI styling
+    │   ├── app.js          # Frontend logic, state management, SSE hookup, UI rendering
+    │   └── styles.css      # Responsive, Discord-inspired styling
     └── templates
-        ├── app.html        # Authenticated shell
+        ├── app.html        # Authenticated app shell, bootstraps initial data
         ├── login.html      # Login form
         └── signup.html     # Signup form
 ```
@@ -45,9 +47,31 @@ EchoSphere is a lightweight Go chat stack with session-based authentication, a p
    go run .
    ```
 
-4. Visit `http://localhost:8080/signup` to create an account. After signing in you are redirected to `http://localhost:8080/` where the chat UI loads and streams messages.
+4. Visit `http://localhost:8080/signup` to create an account, then you are redirected to the chat workspace. Channel history and memberships persist inside `./data/echosphere.db`.
 
-By default SQLite data files live under `./data/echosphere.db`. Delete that file to reset the app.
+## HTTP & Streaming APIs
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/bootstrap` | GET | Initial state (servers, default channel messages, members) after login |
+| `/api/servers/{id}` | GET | List text channels inside a server |
+| `/api/servers/{id}/members` | GET | List members for the selected server |
+| `/api/channels/{id}/messages` | GET | Fetch recent messages (`?limit=200`) |
+| `/api/channels/{id}/messages` | POST | Send a chat message (JSON: `{ "content": "hello" }`) |
+| `/events` | SSE | Stream real-time message events across every channel you can access |
+
+All endpoints expect an authenticated session. SSE pushes payloads of the form:
+
+```json
+{
+  "id": 42,
+  "channelId": 5,
+  "authorEmail": "user@example.com",
+  "authorDisplayName": "User",
+  "content": "Hello world",
+  "createdAt": "2025-10-05T19:20:30Z"
+}
+```
 
 ## Linux Server Deployment (Ubuntu 22.04+)
 
@@ -171,13 +195,16 @@ After verifying HTTP, request certificates with Let's Encrypt (`sudo certbot --n
 ### 8. Verify the deployment
 
 - Tail logs: `sudo journalctl -u echosphere -f`
-- Browse to `http://SERVER_IP:8080/signup`, create two users, and confirm messages stream live between sessions.
+- Browse to `http://SERVER_IP:8080/signup`, create two users, pick different channels, and confirm messages stream live between browsers in real time.
 
-## Operational Notes
+## Roadmap
 
-- **Persistence**: The bundled SQLite file (`data/echosphere.db`) keeps accounts and history. Back it up regularly or migrate to PostgreSQL/MySQL for multi-instance deployments.
-- **Configuration**: Override defaults via environment variables (e.g., `PORT`, future `DATABASE_URL`). Add them to the systemd unit or an `/etc/default/echosphere` drop-in.
-- **TLS**: Always terminate HTTPS in production—reverse proxy examples above assume plaintext between proxy and app.
-- **Logs**: systemd captures stdout/stderr; use `journalctl` for inspection or forward logs to your stack of choice.
+Milestone 2–4 are planned next:
+
+1. **WebSocket backbone** – replace SSE/REST polling with a bidirectional hub for chat, typing indicators, and upcoming signaling needs.
+2. **Voice rooms (single room)** – introduce WebRTC signaling + an SFU backend to support live audio in the default room.
+3. **Full workspace parity** – multi-room voice, screen sharing, richer presence, and polished moderation controls.
+
+Contributions welcome—start by filing an issue or PR for Milestone 2.
 
 Happy chatting!

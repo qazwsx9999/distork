@@ -14,11 +14,18 @@
     <div id="app"></div>
     <script>
       window.APP_CONTEXT = {
-        user: {{printf "%q" .Username}},
-        displayName: {{printf "%q" .DisplayName}},
+        user: { email: {{printf "%q" .Username}}, displayName: {{printf "%q" .DisplayName}} },
+        servers: {{.ServersJSON}},
+        members: {{.MembersJSON}},
         messages: {{.MessagesJSON}},
-        eventsUrl: "/events",
-        messagesUrl: "/api/messages"
+        activeServerId: {{.ActiveServerID}},
+        activeChannelId: {{.ActiveChannelID}},
+        routes: {
+          events: "/events",
+          bootstrap: "/api/bootstrap",
+          servers: "/api/servers",
+          channels: "/api/channels"
+        }
       };
     </script>
     <script src="/static/app.js" defer></script>
