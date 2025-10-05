@@ -18,6 +18,12 @@ const state = {
   socketReady: false,
   pendingEvents: [],
   wsReconnectDelay: 2000,
+  voice: {
+    joined: false,
+    selfId: null,
+    localStream: null,
+    peers: new Map(),
+  },
 };
 
 const refs = {
@@ -31,6 +37,9 @@ const refs = {
   status: null,
   headerTitle: null,
   channelBreadcrumb: null,
+  voiceButton: null,
+  voiceStatus: null,
+  voiceContainer: null,
 };
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -183,6 +192,39 @@ function createChannelPanel() {
   return aside;
 }
 
+function createVoiceControls() {
+  const toolbar = document.createElement('section');
+  toolbar.className = 'voice-toolbar';
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'voice-button';
+  button.textContent = 'Join Voice';
+  button.addEventListener('click', () => {
+    if (state.voice.joined) {
+      leaveVoice();
+    } else {
+      joinVoice();
+    }
+  });
+
+  const status = document.createElement('span');
+  status.className = 'voice-status';
+  status.textContent = 'Disconnected';
+
+  toolbar.appendChild(button);
+  toolbar.appendChild(status);
+
+  const audioContainer = document.createElement('div');
+  audioContainer.className = 'voice-audio-container';
+
+  refs.voiceButton = button;
+  refs.voiceStatus = status;
+  refs.voiceContainer = audioContainer;
+
+  return { toolbar, audioContainer };
+}
+
 function createChatPanel() {
   const main = document.createElement('main');
   main.className = 'chat-panel';
@@ -224,6 +266,10 @@ function createChatPanel() {
   refs.status.setAttribute('role', 'status');
   refs.status.setAttribute('aria-live', 'polite');
   main.appendChild(refs.status);
+
+  const { toolbar, audioContainer } = createVoiceControls();
+  main.appendChild(toolbar);
+  main.appendChild(audioContainer);
 
   const composer = document.createElement('form');
   composer.className = 'composer';
@@ -572,6 +618,266 @@ function subscribeAllChannels() {
   });
 }
 
+function updateVoiceUI(statusText = '') {
+  if (!refs.voiceButton || !refs.voiceStatus) return;
+  if (state.voice.joined) {
+    refs.voiceButton.textContent = 'Leave Voice';
+    refs.voiceButton.classList.add('is-active');
+    refs.voiceStatus.textContent = statusText || 'Live';
+  } else {
+    refs.voiceButton.textContent = 'Join Voice';
+    refs.voiceButton.className = 'voice-button';
+    refs.voiceStatus.textContent = statusText || 'Disconnected';
+  }
+}
+
+function attachLocalStream(stream) {
+  if (!refs.voiceContainer) return;
+  const existing = refs.voiceContainer.querySelector('audio[data-local="true"]');
+  if (existing) {
+    existing.srcObject = stream;
+    return existing;
+  }
+  const audio = document.createElement('audio');
+  audio.dataset.local = 'true';
+  audio.autoplay = true;
+  audio.muted = true;
+  audio.playsInline = true;
+  audio.srcObject = stream;
+  refs.voiceContainer.appendChild(audio);
+  return audio;
+}
+
+function removeAudioElement(el) {
+  if (!el) return;
+  try {
+    el.srcObject = null;
+  } catch (error) {
+    // ignore
+  }
+  if (el.parentElement) {
+    el.parentElement.removeChild(el);
+  }
+}
+
+async function joinVoice() {
+  if (state.voice.joined) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('Voice is not supported in this browser.', 'error');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    state.voice.localStream = stream;
+    state.voice.joined = true;
+    state.voice.peers = new Map();
+    attachLocalStream(stream);
+    updateVoiceUI('Connecting…');
+    sendSocketEvent({ type: 'voice:join' });
+  } catch (error) {
+    console.error('voice join', error);
+    setStatus('Microphone permission denied.', 'error');
+  }
+}
+
+function cleanupVoicePeers() {
+  state.voice.peers.forEach((peer) => {
+    if (peer.pc) {
+      try {
+        peer.pc.onicecandidate = null;
+        peer.pc.ontrack = null;
+        peer.pc.close();
+      } catch (error) {
+        // ignore
+      }
+    }
+    if (peer.audio) {
+      removeAudioElement(peer.audio);
+    }
+  });
+  state.voice.peers.clear();
+}
+
+function stopLocalStream() {
+  if (!state.voice.localStream) return;
+  state.voice.localStream.getTracks().forEach((track) => track.stop());
+  state.voice.localStream = null;
+  const localAudio = refs.voiceContainer && refs.voiceContainer.querySelector('audio[data-local="true"]');
+  removeAudioElement(localAudio);
+}
+
+function leaveVoice() {
+  if (!state.voice.joined) return;
+  sendSocketEvent({ type: 'voice:leave' });
+  cleanupVoicePeers();
+  stopLocalStream();
+  state.voice.joined = false;
+  state.voice.selfId = null;
+  updateVoiceUI();
+}
+
+function ensureVoicePeer(participant, initiator = false) {
+  if (!participant || !participant.id || participant.id === state.voice.selfId) {
+    return null;
+  }
+  if (state.voice.peers.has(participant.id)) {
+    const existing = state.voice.peers.get(participant.id);
+    existing.participant = participant;
+    if (initiator && existing.pc && existing.pc.signalingState === 'stable') {
+      createOffer(existing).catch((error) => console.error('voice offer retry', error));
+    }
+    return existing;
+  }
+
+  if (!state.voice.localStream) {
+    return null;
+  }
+
+  const config = {
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  };
+  const pc = new RTCPeerConnection(config);
+  const peer = {
+    id: participant.id,
+    participant,
+    pc,
+    audio: null,
+  };
+
+  state.voice.localStream.getTracks().forEach((track) => {
+    pc.addTrack(track, state.voice.localStream);
+  });
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      sendSocketEvent({
+        type: 'voice:signal',
+        target: participant.id,
+        payload: {
+          kind: 'candidate',
+          candidate: event.candidate,
+        },
+      });
+    }
+  };
+
+  pc.ontrack = (event) => {
+    if (!refs.voiceContainer) return;
+    if (!peer.audio) {
+      const audio = document.createElement('audio');
+      audio.autoplay = true;
+      audio.playsInline = true;
+      refs.voiceContainer.appendChild(audio);
+      peer.audio = audio;
+    }
+    const [stream] = event.streams;
+    peer.audio.srcObject = stream;
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      removeVoicePeer(participant.id);
+    }
+  };
+
+  state.voice.peers.set(participant.id, peer);
+
+  if (initiator) {
+    createOffer(peer).catch((error) => console.error('voice offer', error));
+  }
+
+  return peer;
+}
+
+async function createOffer(peer) {
+  if (!peer || !peer.pc) return;
+  const offer = await peer.pc.createOffer();
+  await peer.pc.setLocalDescription(offer);
+  sendSocketEvent({
+    type: 'voice:signal',
+    target: peer.id,
+    payload: {
+      kind: 'sdp',
+      description: peer.pc.localDescription,
+    },
+  });
+}
+
+function removeVoicePeer(peerId) {
+  const peer = state.voice.peers.get(peerId);
+  if (!peer) return;
+  if (peer.pc) {
+    try {
+      peer.pc.onicecandidate = null;
+      peer.pc.ontrack = null;
+      peer.pc.close();
+    } catch (error) {
+      // ignore
+    }
+  }
+  if (peer.audio) {
+    removeAudioElement(peer.audio);
+  }
+  state.voice.peers.delete(peerId);
+}
+
+function handleVoiceParticipants(data) {
+  if (!state.voice.joined) return;
+  const { participants = [], self } = data;
+  if (self) {
+    state.voice.selfId = self.id;
+  }
+  participants.forEach((participant) => {
+    ensureVoicePeer(participant, true);
+  });
+  updateVoiceUI('Live');
+}
+
+function handleVoicePeerJoined(participant) {
+  if (!state.voice.joined) return;
+  ensureVoicePeer(participant, false);
+}
+
+function handleVoicePeerLeft(participant) {
+  if (!participant) return;
+  removeVoicePeer(participant.id);
+}
+
+async function handleVoiceSignal(signal) {
+  if (!signal || !state.voice.joined) return;
+  const { from, payload, displayName, email } = signal;
+  if (!from || !payload) return;
+
+  let peer = state.voice.peers.get(from);
+  if (!peer) {
+    peer = ensureVoicePeer({ id: from, displayName, email }, false);
+  }
+  if (!peer || !peer.pc) return;
+
+  if (payload.kind === 'sdp' && payload.description) {
+    const description = payload.description;
+    await peer.pc.setRemoteDescription(description);
+    if (description.type === 'offer') {
+      const answer = await peer.pc.createAnswer();
+      await peer.pc.setLocalDescription(answer);
+      sendSocketEvent({
+        type: 'voice:signal',
+        target: from,
+        payload: {
+          kind: 'sdp',
+          description: peer.pc.localDescription,
+        },
+      });
+    }
+  } else if (payload.kind === 'candidate' && payload.candidate) {
+    try {
+      await peer.pc.addIceCandidate(payload.candidate);
+    } catch (error) {
+      console.error('addIceCandidate', error);
+    }
+  }
+}
+
 function handleSocketMessage(event) {
   try {
     const data = JSON.parse(event.data);
@@ -585,6 +891,18 @@ function handleSocketMessage(event) {
         if (data.error) {
           setStatus(data.error, 'error');
         }
+        break;
+      case 'voice:participants':
+        handleVoiceParticipants(data);
+        break;
+      case 'voice:peer-joined':
+        handleVoicePeerJoined(data.peer);
+        break;
+      case 'voice:peer-left':
+        handleVoicePeerLeft(data.peer);
+        break;
+      case 'voice:signal':
+        handleVoiceSignal(data.signal);
         break;
       default:
         break;
@@ -620,6 +938,7 @@ function connectSocket() {
 
   const socket = new WebSocket(target);
   state.socket = socket;
+  state.socketReady = false;
   setStatus('Connecting…', 'pending');
 
   socket.addEventListener('open', () => {
@@ -628,6 +947,9 @@ function connectSocket() {
     setStatus('');
     subscribeAllChannels();
     flushPendingEvents();
+    if (state.voice.joined) {
+      sendSocketEvent({ type: 'voice:join' });
+    }
   });
 
   socket.addEventListener('message', handleSocketMessage);
@@ -660,7 +982,6 @@ async function handleSubmit(event) {
     refs.composerInput.style.height = 'auto';
     setStatus('');
   } else {
-    // fallback to HTTP if the socket is down
     setStatus('Sending…', 'pending');
     try {
       const payload = await fetchJSON(`${state.routes.channels}/${state.activeChannelId}/messages`, {
@@ -688,12 +1009,21 @@ function pushMessage(msg, { scroll = false } = {}) {
   bucket.push(msg);
   bucket.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 
-  const server = state.servers.find((srv) => (srv.channels || []).some((ch) => ch.id === msg.channelId));
+  let owningServer = null;
+  state.servers.some((server) => {
+    const match = (server.channels || []).some((ch) => ch.id === msg.channelId);
+    if (match) {
+      owningServer = server;
+      return true;
+    }
+    return false;
+  });
+
   if (msg.channelId === state.activeChannelId) {
     renderMessages();
     if (scroll) scrollToBottom(true);
-  } else if (server) {
-    addUnread(msg.channelId, server.id);
+  } else if (owningServer) {
+    addUnread(msg.channelId, owningServer.id);
   }
 }
 
@@ -721,6 +1051,9 @@ async function bootstrapLatest() {
     updateBreadcrumb();
     updateComposerPlaceholder();
     subscribeAllChannels();
+    if (state.voice.joined) {
+      sendSocketEvent({ type: 'voice:join' });
+    }
   } catch (error) {
     console.error('bootstrap refresh', error);
   }
@@ -751,6 +1084,7 @@ async function init() {
   renderMessages();
   updateBreadcrumb();
   updateComposerPlaceholder();
+  updateVoiceUI();
   connectSocket();
   setStatus('');
 
@@ -767,6 +1101,8 @@ window.addEventListener('beforeunload', () => {
       // ignore
     }
   }
+  cleanupVoicePeers();
+  stopLocalStream();
 });
 
 window.addEventListener('DOMContentLoaded', init);

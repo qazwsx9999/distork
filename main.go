@@ -74,6 +74,7 @@ type serverState struct {
 	templates *template.Template
 	db        *sql.DB
 	ws        *wsHub
+	voice     *voiceState
 
 	mu       sync.RWMutex
 	sessions map[string]string // sessionID -> email
@@ -114,6 +115,7 @@ func main() {
 		templates: templates,
 		db:        db,
 		ws:        newWSHub(),
+		voice:     newVoiceState(),
 		sessions:  make(map[string]string),
 	}
 

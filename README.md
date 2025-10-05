@@ -11,6 +11,7 @@ EchoSphere is a lightweight Go + Vanilla JS stack that gives you a Discord-style
 - `/api/channels/{id}/messages` REST endpoint (GET history / POST new message)
 - `/api/servers/{id}/members` endpoint for member lists, `/api/bootstrap` for initial state hydration
 - `/ws` WebSocket endpoint delivers realtime channel events (subscribe/send)
+- Single-room voice chat via WebRTC with browser-based join/leave controls
 - Modern single-page experience (no frameworks) with responsive layout and offline-friendly fallbacks
 
 ## Project Layout
@@ -72,6 +73,19 @@ All endpoints expect an authenticated session. WebSocket `message` events look l
   "createdAt": "2025-10-05T19:20:30Z"
 }
 ```
+
+### WebSocket Voice Events
+
+| Event | Direction | Payload | Description |
+| --- | --- | --- | --- |
+| `voice:join` | client ? server | none | Request to join the shared voice room. Returns a `voice:participants` message with current peers. |
+| `voice:leave` | client ? server | none | Leave the voice room and notify other peers. |
+| `voice:participants` | server ? client | `{ participants: [], self: {} }` | Snapshot of current peers plus the caller's voice ID. |
+| `voice:peer-joined` | server ? client | `{ peer: {} }` | Another participant joined; await their offer. |
+| `voice:peer-left` | server ? client | `{ peer: {} }` | Participant disconnected; remove audio for that peer. |
+| `voice:signal` | bidirectional | `{ signal: { from, payload } }` | Forward WebRTC SDP/ICE payloads between peers for negotiation. |
+
+`voice:signal` payloads wrap either `{ kind: "sdp", description: RTCSessionDescription }` or `{ kind: "candidate", candidate: RTCIceCandidate }`.
 
 ## Linux Server Deployment (Ubuntu 22.04+)
 

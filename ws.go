@@ -35,9 +35,68 @@ type wsHub struct {
 	channelSubs map[int64]map[*wsClient]struct{}
 }
 
+type voiceState struct {
+	mu           sync.RWMutex
+	participants map[string]*wsClient
+}
+
+type voiceParticipant struct {
+	ID          string `json:"id"`
+	Email       string `json:"email"`
+	DisplayName string `json:"displayName"`
+}
+
+type voiceSignal struct {
+	From        string          `json:"from"`
+	Email       string          `json:"email"`
+	DisplayName string          `json:"displayName"`
+	Payload     json.RawMessage `json:"payload"`
+}
+
+type wsClient struct {
+	id            string
+	state         *serverState
+	hub           *wsHub
+	conn          *websocket.Conn
+	send          chan []byte
+	user          user
+	subscriptions map[int64]struct{}
+	mu            sync.Mutex
+	closeOnce     sync.Once
+
+	voiceJoined bool
+	voiceID     string
+}
+
+type wsInbound struct {
+	Type      string          `json:"type"`
+	ChannelID int64           `json:"channelId,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	Target    string          `json:"target,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+}
+
+type wsOutbound struct {
+	Type         string             `json:"type"`
+	ChannelID    int64              `json:"channelId,omitempty"`
+	Message      *messageDTO        `json:"message,omitempty"`
+	Error        string             `json:"error,omitempty"`
+	Code         string             `json:"code,omitempty"`
+	Participants []voiceParticipant `json:"participants,omitempty"`
+	Self         *voiceParticipant  `json:"self,omitempty"`
+	Peer         *voiceParticipant  `json:"peer,omitempty"`
+	Signal       *voiceSignal       `json:"signal,omitempty"`
+}
+
 func newWSHub() *wsHub {
 	return &wsHub{
 		channelSubs: make(map[int64]map[*wsClient]struct{}),
+	}
+}
+
+func newVoiceState() *voiceState {
+	return &voiceState{
+		participants: make(map[string]*wsClient),
 	}
 }
 
@@ -79,35 +138,15 @@ func (h *wsHub) removeClient(client *wsClient) {
 func (h *wsHub) broadcast(channelID int64, payload []byte) {
 	h.mu.RLock()
 	subs := h.channelSubs[channelID]
+	clients := make([]*wsClient, 0, len(subs))
 	for client := range subs {
-		client.enqueue(payload)
+		clients = append(clients, client)
 	}
 	h.mu.RUnlock()
-}
 
-type wsClient struct {
-	state         *serverState
-	hub           *wsHub
-	conn          *websocket.Conn
-	send          chan []byte
-	user          user
-	subscriptions map[int64]struct{}
-	mu            sync.Mutex
-	closeOnce     sync.Once
-}
-
-type wsInbound struct {
-	Type      string `json:"type"`
-	ChannelID int64  `json:"channelId"`
-	Content   string `json:"content"`
-}
-
-type wsOutbound struct {
-	Type      string      `json:"type"`
-	ChannelID int64       `json:"channelId,omitempty"`
-	Message   *messageDTO `json:"message,omitempty"`
-	Error     string      `json:"error,omitempty"`
-	Code      string      `json:"code,omitempty"`
+	for _, client := range clients {
+		client.enqueue(payload)
+	}
 }
 
 func (c *wsClient) readLoop() {
@@ -166,6 +205,12 @@ func (c *wsClient) handleEvent(evt wsInbound) {
 		c.handleUnsubscribe(evt.ChannelID)
 	case "message":
 		c.handleMessage(evt.ChannelID, evt.Content)
+	case "voice:join":
+		c.handleVoiceJoin()
+	case "voice:leave":
+		c.handleVoiceLeave()
+	case "voice:signal":
+		c.handleVoiceSignal(evt.Target, evt.Payload)
 	default:
 		c.sendError("unsupported_event", "unsupported event type")
 	}
@@ -176,7 +221,6 @@ func (c *wsClient) handleSubscribe(channelID int64) {
 		c.sendError("invalid_channel", "channel id required")
 		return
 	}
-
 	ch, exists, err := c.state.channelByID(context.Background(), channelID)
 	if err != nil {
 		log.Printf("ws subscribe channel lookup: %v", err)
@@ -203,28 +247,19 @@ func (c *wsClient) handleSubscribe(channelID int64) {
 	if c.subscriptions == nil {
 		c.subscriptions = make(map[int64]struct{})
 	}
-	if _, already := c.subscriptions[channelID]; already {
-		c.mu.Unlock()
-		return
-	}
 	c.subscriptions[channelID] = struct{}{}
 	c.mu.Unlock()
 
 	c.hub.subscribe(c, channelID)
-	c.enqueueJSON(wsOutbound{Type: "subscribed", ChannelID: channelID})
 }
 
 func (c *wsClient) handleUnsubscribe(channelID int64) {
 	c.mu.Lock()
-	if _, exists := c.subscriptions[channelID]; !exists {
-		c.mu.Unlock()
-		return
+	if c.subscriptions != nil {
+		delete(c.subscriptions, channelID)
 	}
-	delete(c.subscriptions, channelID)
 	c.mu.Unlock()
-
 	c.hub.unsubscribe(c, channelID)
-	c.enqueueJSON(wsOutbound{Type: "unsubscribed", ChannelID: channelID})
 }
 
 func (c *wsClient) handleMessage(channelID int64, content string) {
@@ -257,7 +292,47 @@ func (c *wsClient) handleMessage(channelID int64, content string) {
 		msg.AuthorDisplayName = c.user.DisplayName
 	}
 
-	c.state.broadcastMessage(toMessageDTO(msg))
+	dto := toMessageDTO(msg)
+	c.state.broadcastMessage(dto)
+}
+
+func (c *wsClient) handleVoiceJoin() {
+	if c.voiceJoined {
+		participants := c.state.voiceSnapshot(c)
+		self := c.voiceParticipant()
+		c.enqueueJSON(wsOutbound{Type: "voice:participants", Participants: participants, Self: &self})
+		return
+	}
+
+	participants, self := c.state.voiceRegister(c)
+	c.enqueueJSON(wsOutbound{Type: "voice:participants", Participants: participants, Self: &self})
+	c.state.voiceNotifyJoin(self, c)
+}
+
+func (c *wsClient) handleVoiceLeave() {
+	participant, removed := c.state.voiceUnregister(c)
+	if removed {
+		c.state.voiceNotifyLeave(participant, c)
+	}
+}
+
+func (c *wsClient) handleVoiceSignal(target string, payload json.RawMessage) {
+	if !c.voiceJoined || c.voiceID == "" {
+		c.sendError("voice_not_joined", "join voice before sending media")
+		return
+	}
+	if target == "" || len(payload) == 0 {
+		c.sendError("voice_invalid", "signal target and payload required")
+		return
+	}
+	if err := c.state.voiceSignal(c, target, payload); err != nil {
+		if errors.Is(err, errVoiceTargetMissing) {
+			c.sendError("voice_target_missing", "target not available")
+		} else {
+			log.Printf("voice signal: %v", err)
+			c.sendError("internal", "failed to forward signal")
+		}
+	}
 }
 
 func (c *wsClient) sendError(code, message string) {
@@ -290,6 +365,7 @@ func (c *wsClient) enqueueJSON(v any) {
 
 func (c *wsClient) close() {
 	c.closeOnce.Do(func() {
+		c.state.voiceUnregister(c)
 		c.hub.removeClient(c)
 
 		c.mu.Lock()
@@ -324,10 +400,11 @@ func (s *serverState) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &wsClient{
+		id:    generateSessionID(),
 		state: s,
 		hub:   s.ws,
 		conn:  conn,
-		send:  make(chan []byte, 32),
+		send:  make(chan []byte, 64),
 		user:  currentUser,
 	}
 
@@ -343,4 +420,122 @@ func (s *serverState) broadcastMessage(msg messageDTO) {
 		return
 	}
 	s.ws.broadcast(msg.ChannelID, payload)
+}
+
+var errVoiceTargetMissing = errors.New("voice target missing")
+
+func (s *serverState) voiceRegister(client *wsClient) ([]voiceParticipant, voiceParticipant) {
+	s.voice.mu.Lock()
+	defer s.voice.mu.Unlock()
+
+	if client.voiceJoined && client.voiceID != "" {
+		participants := make([]voiceParticipant, 0, len(s.voice.participants))
+		for _, other := range s.voice.participants {
+			if other == client {
+				continue
+			}
+			participants = append(participants, other.voiceParticipant())
+		}
+		return participants, client.voiceParticipant()
+	}
+
+	if client.voiceID == "" {
+		client.voiceID = generateSessionID()
+	}
+	client.voiceJoined = true
+
+	participants := make([]voiceParticipant, 0, len(s.voice.participants))
+	for _, other := range s.voice.participants {
+		participants = append(participants, other.voiceParticipant())
+	}
+
+	s.voice.participants[client.voiceID] = client
+
+	return participants, client.voiceParticipant()
+}
+
+func (s *serverState) voiceUnregister(client *wsClient) (voiceParticipant, bool) {
+	s.voice.mu.Lock()
+	defer s.voice.mu.Unlock()
+
+	if !client.voiceJoined || client.voiceID == "" {
+		return voiceParticipant{}, false
+	}
+
+	part := client.voiceParticipant()
+	delete(s.voice.participants, client.voiceID)
+	client.voiceJoined = false
+	client.voiceID = ""
+	return part, true
+}
+
+func (s *serverState) voiceSnapshot(exclude *wsClient) []voiceParticipant {
+	s.voice.mu.RLock()
+	defer s.voice.mu.RUnlock()
+	participants := make([]voiceParticipant, 0, len(s.voice.participants))
+	for _, other := range s.voice.participants {
+		if other == exclude {
+			continue
+		}
+		participants = append(participants, other.voiceParticipant())
+	}
+	return participants
+}
+
+func (s *serverState) voiceNotifyJoin(part voiceParticipant, exclude *wsClient) {
+	outbound := wsOutbound{Type: "voice:peer-joined", Peer: &part}
+	s.voiceBroadcast(outbound, exclude)
+}
+
+func (s *serverState) voiceNotifyLeave(part voiceParticipant, exclude *wsClient) {
+	outbound := wsOutbound{Type: "voice:peer-left", Peer: &part}
+	s.voiceBroadcast(outbound, exclude)
+}
+
+func (s *serverState) voiceSignal(sender *wsClient, targetID string, payload json.RawMessage) error {
+	s.voice.mu.RLock()
+	target, ok := s.voice.participants[targetID]
+	s.voice.mu.RUnlock()
+	if !ok {
+		return errVoiceTargetMissing
+	}
+
+	signal := wsOutbound{Type: "voice:signal", Signal: &voiceSignal{
+		From:        sender.voiceID,
+		Email:       sender.user.Email,
+		DisplayName: sender.user.DisplayName,
+		Payload:     payload,
+	}}
+	target.enqueueJSON(signal)
+	return nil
+}
+
+func (s *serverState) voiceBroadcast(outbound wsOutbound, exclude *wsClient) {
+	payload, err := json.Marshal(outbound)
+	if err != nil {
+		log.Printf("marshal voice broadcast: %v", err)
+		return
+	}
+
+	s.voice.mu.RLock()
+	clients := make([]*wsClient, 0, len(s.voice.participants))
+	for _, client := range s.voice.participants {
+		if exclude != nil && client == exclude {
+			continue
+		}
+		clients = append(clients, client)
+	}
+	s.voice.mu.RUnlock()
+
+	for _, client := range clients {
+		client.enqueue(append([]byte(nil), payload...))
+	}
+}
+
+func (c *wsClient) voiceParticipant() voiceParticipant {
+	return voiceParticipant{
+		ID:          c.voiceID,
+		Email:       c.user.Email,
+		DisplayName: c.user.DisplayName,
+	}
 }
