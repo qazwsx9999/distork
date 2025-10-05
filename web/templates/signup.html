@@ -1,0 +1,45 @@
+﻿{{define "signup"}}
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EchoSphere · Sign Up</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="auth-page">
+    <main class="auth-card">
+      <header>
+        <h1>Create your EchoSphere account</h1>
+        <p class="auth-subtitle">Claim your handle and start collaborating.</p>
+      </header>
+      {{if .Error}}
+      <div class="auth-alert">{{.Error}}</div>
+      {{end}}
+      <form method="POST" action="/signup" class="auth-form">
+        <label>
+          Email
+          <input type="email" name="email" required autocomplete="username" />
+        </label>
+        <label>
+          Display Name
+          <input type="text" name="display_name" required />
+        </label>
+        <label>
+          Password
+          <input type="password" name="password" minlength="8" required autocomplete="new-password" />
+        </label>
+        <label>
+          Confirm Password
+          <input type="password" name="confirm_password" minlength="8" required autocomplete="new-password" />
+        </label>
+        <button class="button primary auth-submit" type="submit">Create Account</button>
+      </form>
+      <p class="auth-meta">
+        Already have an account?
+        <a href="/login">Sign in</a>
+      </p>
+    </main>
+  </body>
+</html>
+{{end}}

@@ -1,0 +1,18 @@
+﻿{{define "app"}}
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EchoSphere</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.APP_CONTEXT = { user: {{printf "%q" .Username}}, displayName: {{printf "%q" .DisplayName}} };
+    </script>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
+{{end}}
