@@ -4,13 +4,22 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>EchoSphere</title>
+    <title>EchoSphere Chat</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
+    <noscript>
+      <div class="noscript-warning">EchoSphere needs JavaScript to run. Please enable it to continue.</div>
+    </noscript>
     <div id="app"></div>
     <script>
-      window.APP_CONTEXT = { user: {{printf "%q" .Username}}, displayName: {{printf "%q" .DisplayName}} };
+      window.APP_CONTEXT = {
+        user: {{printf "%q" .Username}},
+        displayName: {{printf "%q" .DisplayName}},
+        messages: {{.MessagesJSON}},
+        eventsUrl: "/events",
+        messagesUrl: "/api/messages"
+      };
     </script>
     <script src="/static/app.js" defer></script>
   </body>

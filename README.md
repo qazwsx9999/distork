@@ -1,72 +1,83 @@
-﻿# EchoSphere Voice Collaboration UI
+﻿# EchoSphere Chat Server
 
-EchoSphere is a Discord-inspired collaboration surface featuring live voice rooms, screen sharing prompts, and activity streams. A Go backend provides account signup/login with session cookies, while the frontend delivers the immersive UI.
+EchoSphere is a lightweight Go chat stack with session-based authentication, a persistent SQLite datastore, and a browser client that streams messages live over Server-Sent Events (SSE). Users can sign up, log in, and exchange messages in real time.
+
+## Features
+
+- Email + password signup/login backed by bcrypt hashing
+- Cookie sessions with secure random identifiers
+- SQLite persistence for users and chat history
+- `/api/messages` REST endpoint (GET history, POST new message)
+- `/events` SSE stream for broadcasting new chat messages instantly
+- Single-page frontend (vanilla JS + CSS) packaged under `web/`
 
 ## Project Layout
 
 ```
 .
-├── main.go                 # Go HTTP server with auth and session handling
+├── main.go                 # HTTP server, routing, handlers, SSE wiring
+├── storage.go              # Database schema + access helpers
+├── events.go               # In-memory pub/sub broker for SSE clients
 ├── go.mod / go.sum         # Module definition and dependencies
 └── web
     ├── static
-    │   ├── app.js          # Frontend logic and UI rendering
-    │   └── styles.css      # Styling for app + auth pages
+    │   ├── app.js          # Frontend logic, SSE hookup, composer
+    │   └── styles.css      # Chat UI styling
     └── templates
-        ├── app.html        # Main application surface (requires auth)
-        ├── login.html      # Sign-in form with inline error feedback
-        └── signup.html     # Account creation form
+        ├── app.html        # Authenticated shell
+        ├── login.html      # Login form
+        └── signup.html     # Signup form
 ```
 
-## Running Locally (Windows, macOS, Linux)
+## Local Development (Windows, macOS, Linux)
 
-1. Ensure Go 1.21+ is installed (`go version`).
-2. From the project root, download dependencies and build:
+1. Install Go 1.21+ (`go version`).
+2. Fetch dependencies and verify the build:
 
    ```bash
    go mod tidy
    go build ./...
    ```
 
-3. Start the development server:
+3. Run the server:
 
    ```bash
-   go run main.go
+   go run .
    ```
 
-4. Visit `http://localhost:8080/signup` to create your first account. Subsequent requests to `/` redirect you to the app UI once signed in.
+4. Visit `http://localhost:8080/signup` to create an account. After signing in you are redirected to `http://localhost:8080/` where the chat UI loads and streams messages.
 
-Sessions are held in memory; restarting the server clears accounts and sessions.
+By default SQLite data files live under `./data/echosphere.db`. Delete that file to reset the app.
 
-## Ubuntu Server Deployment Guide
+## Linux Server Deployment (Ubuntu 22.04+)
 
-The following example assumes Ubuntu 22.04 LTS or newer.
+The steps below show how to deploy on a fresh Ubuntu server using systemd. Adjust paths if you prefer a different layout.
 
-### 1. Install system packages
+### 1. Install base packages
 
 ```bash
 sudo apt update
 sudo apt install -y curl git ufw
 ```
 
-### 2. Install Go (official tarball)
+### 2. Install Go from the official tarball
 
 ```bash
 GO_VERSION="1.24.5"
-curl -OL https://go.dev/dl/go${1.24.5}.linux-amd64.tar.gz
+curl -OL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
 sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz
-rm go${GO_VERSION}.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf "go${GO_VERSION}.linux-amd64.tar.gz"
+rm "go${GO_VERSION}.linux-amd64.tar.gz"
 ```
 
-Append Go to your shell profile (e.g. `~/.profile`):
+Append Go to your shell profile and reload:
 
 ```bash
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.profile
 source ~/.profile
 ```
 
-### 3. Create a deploy user and directories
+### 3. Create an application user and directory
 
 ```bash
 sudo useradd -m -s /bin/bash echosphere
@@ -74,25 +85,39 @@ sudo mkdir -p /opt/echosphere
 sudo chown -R echosphere:echosphere /opt/echosphere
 ```
 
-### 4. Build and copy the application
+### 4. Deploy the source
 
-On your local machine:
+Option A – build locally then upload:
 
 ```bash
 GOOS=linux GOARCH=amd64 go build -o echosphere
-scp echosphere web -r echosphere@YOUR_SERVER_IP:/opt/echosphere/
-scp main.go go.mod go.sum echosphere@YOUR_SERVER_IP:/opt/echosphere/
+scp echosphere -r web echosphere@YOUR_SERVER_IP:/opt/echosphere/
+scp main.go storage.go events.go go.mod go.sum echosphere@YOUR_SERVER_IP:/opt/echosphere/
 ```
 
-(Alternatively clone the repository directly on the server and run `go build` there.)
+Option B – build on the server:
 
-### 5. Configure a systemd service
+```bash
+ssh echosphere@YOUR_SERVER_IP
+cd /opt/echosphere
+git clone YOUR_REPO_URL .   # or copy files via scp/rsync
+go build -o echosphere
+```
 
-On the server, create `/etc/systemd/system/echosphere.service`:
+Ensure the data directory exists and is writable:
+
+```bash
+mkdir -p /opt/echosphere/data
+chown echosphere:echosphere /opt/echosphere/data
+```
+
+### 5. Configure systemd
+
+Create `/etc/systemd/system/echosphere.service` with root privileges:
 
 ```ini
 [Unit]
-Description=EchoSphere Voice Collaboration Server
+Description=EchoSphere Chat Server
 After=network.target
 
 [Service]
@@ -115,22 +140,22 @@ sudo systemctl enable --now echosphere
 sudo systemctl status echosphere
 ```
 
-### 6. (Optional) Configure UFW firewall
+### 6. Open the firewall
 
 ```bash
 sudo ufw allow OpenSSH
 sudo ufw allow 8080/tcp
-sudo ufw enable
+sudo ufw enable   # answer "y" when prompted
 ```
 
-### 7. Reverse proxy (optional but recommended)
+### 7. Add a reverse proxy (recommended)
 
-Use Nginx or Caddy in front of the Go server to terminate TLS and map a domain. Example Nginx server block snippet:
+Use Nginx, Caddy, or another proxy to terminate TLS and forward traffic to the Go service. Example Nginx block:
 
 ```nginx
 server {
     listen 80;
-    server_name your-domain.com;
+    server_name chat.example.com;
 
     location / {
         proxy_pass http://127.0.0.1:8080;
@@ -141,11 +166,18 @@ server {
 }
 ```
 
-Add Let\'s Encrypt TLS with `certbot --nginx` afterward.
+After verifying HTTP, request certificates with Let's Encrypt (`sudo certbot --nginx`).
 
----
+### 8. Verify the deployment
 
-Deployment tips:
-- Because accounts live in memory, wire an external database (PostgreSQL, MySQL, or SQLite) for persistence before production use.
-- Set `PORT` (and future secrets) via environment variables in the systemd unit or a dotenv loader.
-- Run the Go binary behind a process supervisor (systemd as shown) for auto restarts and logging.
+- Tail logs: `sudo journalctl -u echosphere -f`
+- Browse to `http://SERVER_IP:8080/signup`, create two users, and confirm messages stream live between sessions.
+
+## Operational Notes
+
+- **Persistence**: The bundled SQLite file (`data/echosphere.db`) keeps accounts and history. Back it up regularly or migrate to PostgreSQL/MySQL for multi-instance deployments.
+- **Configuration**: Override defaults via environment variables (e.g., `PORT`, future `DATABASE_URL`). Add them to the systemd unit or an `/etc/default/echosphere` drop-in.
+- **TLS**: Always terminate HTTPS in production—reverse proxy examples above assume plaintext between proxy and app.
+- **Logs**: systemd captures stdout/stderr; use `journalctl` for inspection or forward logs to your stack of choice.
+
+Happy chatting!
