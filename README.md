@@ -11,7 +11,7 @@ EchoSphere is a lightweight Go + Vanilla JS stack that gives you a Discord-style
 - `/api/channels/{id}/messages` REST endpoint (GET history / POST new message)
 - `/api/servers/{id}/members` endpoint for member lists, `/api/bootstrap` for initial state hydration
 - `/ws` WebSocket endpoint delivers realtime channel events (subscribe/send)
-- Single-room voice chat via WebRTC with browser-based join/leave controls
+- Create unlimited servers and text/voice channels; voice chat uses WebRTC per channel
 - Modern single-page experience (no frameworks) with responsive layout and offline-friendly fallbacks
 
 ## Project Layout
@@ -55,11 +55,21 @@ EchoSphere is a lightweight Go + Vanilla JS stack that gives you a Discord-style
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
 | `/api/bootstrap` | GET | Initial state (servers, default channel messages, members) after login |
-| `/api/servers/{id}` | GET | List text channels inside a server |
+| `/api/servers` | POST | Create a new server (owner becomes the creator) |
+| `/api/servers/{id}` | GET | List channels inside a server |
+| `/api/servers/{id}` | POST | Create a channel in the server (`{ name, kind }`, kind=`text`/`voice`) |
 | `/api/servers/{id}/members` | GET | List members for the selected server |
 | `/api/channels/{id}/messages` | GET | Fetch recent messages (`?limit=200`) |
 | `/api/channels/{id}/messages` | POST | Send a chat message (JSON: `{ "content": "hello" }`) |
 | `/ws` | WebSocket | Bidirectional channel for subscribing and sending chat events |
+
+### Creating Servers & Channels
+
+Use `POST /api/servers` with a JSON body like `{ "name": "Product Team" }` to spin up a workspace.
+The creator is automatically added as an owner and a default `general` text channel is provisioned.
+
+To add more rooms, `POST /api/servers/{serverId}` with `{ "name": "Design Sync", "kind": "voice" }` or "text" for a chat channel.
+Each channel is addressable via `channelId` (needed for the WebSocket `subscribe`, `message`, and `voice:*` events).
 
 All endpoints expect an authenticated session. WebSocket `message` events look like:
 
@@ -74,7 +84,21 @@ All endpoints expect an authenticated session. WebSocket `message` events look l
 }
 ```
 
-### WebSocket Voice Events
+### WebSocket Events
+
+| Event | Direction | Payload | Description |
+| --- | --- | --- | --- |
+| `subscribe` | client ? server | `{ channelId }` | Listen for channel messages in real time. |
+| `message` | client ? server | `{ channelId, content }` | Post a text message (text channels only). |
+| `voice:join` | client ? server | `{ channelId }` | Join a voice channel. Returns `voice:participants`. |
+| `voice:leave` | client ? server | `{ channelId }` | Leave the voice channel. |
+| `voice:participants` | server ? client | `{ channelId, participants: [], self: {} }` | Snapshot of peers currently in the voice room. |
+| `voice:peer-joined` | server ? client | `{ channelId, peer: {} }` | Another participant joined; expect an SDP offer. |
+| `voice:peer-left` | server ? client | `{ channelId, peer: {} }` | Participant disconnected; remove their stream. |
+| `voice:signal` | bidirectional | `{ channelId, signal: { from, payload } }` | Forward WebRTC SDP/ICE payloads between peers. |
+
+`voice:signal` payloads wrap either `{ kind: "sdp", description: RTCSessionDescription }` or `{ kind: "candidate", candidate: RTCIceCandidate }`.
+
 
 | Event | Direction | Payload | Description |
 | --- | --- | --- | --- |

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type channelInfo struct {
 	ServerID  int64
 	Slug      string
 	Name      string
+	Kind      string
 	CreatedAt time.Time
 }
 
@@ -86,12 +88,19 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
         server_id INTEGER NOT NULL,
         slug TEXT NOT NULL,
         name TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'text',
         created_at TIMESTAMP NOT NULL,
         UNIQUE(server_id, slug),
         FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
     );`
 	if _, err := db.ExecContext(ctx, channelsTable); err != nil {
 		return err
+	}
+
+	if _, err := db.ExecContext(ctx, "ALTER TABLE channels ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'"); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return err
+		}
 	}
 
 	const messagesTable = `
@@ -138,7 +147,7 @@ func (s *serverState) ensureDefaultWorkspace(ctx context.Context) error {
 		}
 		s.defaultServerID = serverID
 
-		_, err = s.db.ExecContext(ctx, `INSERT INTO channels (server_id, slug, name, created_at) VALUES (?, ?, ?, ?)`, serverID, "general", "general", now)
+		_, err = s.db.ExecContext(ctx, `INSERT INTO channels (server_id, slug, name, kind, created_at) VALUES (?, ?, ?, ?, ?)`, serverID, "general", "general", "text", now)
 		if err != nil {
 			return err
 		}
@@ -158,7 +167,7 @@ func (s *serverState) ensureDefaultWorkspace(ctx context.Context) error {
 			return err
 		}
 		now := time.Now().UTC()
-		res, err := s.db.ExecContext(ctx, `INSERT INTO channels (server_id, slug, name, created_at) VALUES (?, ?, ?, ?)`, s.defaultServerID, "general", "general", now)
+		res, err := s.db.ExecContext(ctx, `INSERT INTO channels (server_id, slug, name, kind, created_at) VALUES (?, ?, ?, ?, ?)`, s.defaultServerID, "general", "general", "text", now)
 		if err != nil {
 			return err
 		}
@@ -291,7 +300,7 @@ func (s *serverState) serversForUser(ctx context.Context, email string) ([]serve
 
 func (s *serverState) channelsForServer(ctx context.Context, serverID int64) ([]channelInfo, error) {
 	rows, err := s.db.QueryContext(ctx, `
-        SELECT id, server_id, slug, name, created_at
+        SELECT id, server_id, slug, name, kind, created_at
         FROM channels
         WHERE server_id = ?
         ORDER BY created_at
@@ -304,7 +313,7 @@ func (s *serverState) channelsForServer(ctx context.Context, serverID int64) ([]
 	var result []channelInfo
 	for rows.Next() {
 		var ch channelInfo
-		if err := rows.Scan(&ch.ID, &ch.ServerID, &ch.Slug, &ch.Name, &ch.CreatedAt); err != nil {
+		if err := rows.Scan(&ch.ID, &ch.ServerID, &ch.Slug, &ch.Name, &ch.Kind, &ch.CreatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, ch)
@@ -337,10 +346,10 @@ func (s *serverState) membersForServer(ctx context.Context, serverID int64) ([]m
 }
 
 func (s *serverState) channelByID(ctx context.Context, channelID int64) (channelInfo, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, server_id, slug, name, created_at FROM channels WHERE id = ?`, channelID)
+	row := s.db.QueryRowContext(ctx, `SELECT id, server_id, slug, name, kind, created_at FROM channels WHERE id = ?`, channelID)
 
 	var ch channelInfo
-	if err := row.Scan(&ch.ID, &ch.ServerID, &ch.Slug, &ch.Name, &ch.CreatedAt); err != nil {
+	if err := row.Scan(&ch.ID, &ch.ServerID, &ch.Slug, &ch.Name, &ch.Kind, &ch.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return channelInfo{}, false, nil
 		}
@@ -360,4 +369,61 @@ func (s *serverState) userHasServerAccess(ctx context.Context, email string, ser
 		return false, err
 	}
 	return true, nil
+}
+
+func (s *serverState) createServer(ctx context.Context, name, slug, ownerEmail string) (serverInfo, channelInfo, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return serverInfo{}, channelInfo{}, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	now := time.Now().UTC()
+	res, err := tx.ExecContext(ctx, `INSERT INTO servers (slug, name, created_at) VALUES (?, ?, ?)`, slug, name, now)
+	if err != nil {
+		return serverInfo{}, channelInfo{}, err
+	}
+	serverID, err := res.LastInsertId()
+	if err != nil {
+		return serverInfo{}, channelInfo{}, err
+	}
+
+	if _, err = tx.ExecContext(ctx, `INSERT INTO server_members (server_id, user_email, role, joined_at) VALUES (?, ?, 'owner', ?)`, serverID, ownerEmail, now); err != nil {
+		return serverInfo{}, channelInfo{}, err
+	}
+
+	res, err = tx.ExecContext(ctx, `INSERT INTO channels (server_id, slug, name, kind, created_at) VALUES (?, ?, ?, ?, ?)`, serverID, "general", "general", "text", now)
+	if err != nil {
+		return serverInfo{}, channelInfo{}, err
+	}
+	channelID, err := res.LastInsertId()
+	if err != nil {
+		return serverInfo{}, channelInfo{}, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return serverInfo{}, channelInfo{}, err
+	}
+
+	server := serverInfo{ID: serverID, Slug: slug, Name: name, CreatedAt: now}
+	channel := channelInfo{ID: channelID, ServerID: serverID, Slug: "general", Name: "general", Kind: "text", CreatedAt: now}
+
+	return server, channel, nil
+}
+
+func (s *serverState) createChannel(ctx context.Context, serverID int64, name, slug, kind string) (channelInfo, error) {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `INSERT INTO channels (server_id, slug, name, kind, created_at) VALUES (?, ?, ?, ?, ?)`, serverID, slug, name, kind, now)
+	if err != nil {
+		return channelInfo{}, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return channelInfo{}, err
+	}
+	return channelInfo{ID: id, ServerID: serverID, Slug: slug, Name: name, Kind: kind, CreatedAt: now}, nil
 }

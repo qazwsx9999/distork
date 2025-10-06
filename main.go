@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
@@ -131,6 +132,7 @@ func main() {
 	mux.HandleFunc("/logout", srv.handleLogout)
 	mux.HandleFunc("/ws", srv.handleWS)
 	mux.HandleFunc("/api/bootstrap", srv.handleBootstrap)
+	mux.HandleFunc("/api/servers", srv.handleServersCollection)
 	mux.Handle("/api/servers/", http.StripPrefix("/api/servers/", http.HandlerFunc(srv.handleServerAPI)))
 	mux.Handle("/api/channels/", http.StripPrefix("/api/channels/", http.HandlerFunc(srv.handleChannelAPI)))
 
@@ -255,7 +257,7 @@ func (s *serverState) buildBootstrapPayload(ctx context.Context, currentUser use
 				Slug:      ch.Slug,
 				Name:      ch.Name,
 				CreatedAt: ch.CreatedAt,
-				Type:      "text",
+				Type:      ch.Kind,
 			})
 		}
 
@@ -345,6 +347,78 @@ func (s *serverState) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *serverState) handleServersCollection(w http.ResponseWriter, r *http.Request) {
+	currentUser, ok := s.userFromRequest(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		body.Name = strings.TrimSpace(body.Name)
+		if body.Name == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+
+		baseSlug := slugify(body.Name)
+		slug := baseSlug
+		ctx := r.Context()
+		var srvInfo serverInfo
+		var chInfo channelInfo
+		var err error
+		for i := 0; i < 8; i++ {
+			srvInfo, chInfo, err = s.createServer(ctx, body.Name, slug, currentUser.Email)
+			if err == nil {
+				break
+			}
+			if strings.Contains(err.Error(), "UNIQUE constraint failed: servers.slug") {
+				slug = baseSlug + "-" + generateSessionID()[:6]
+				continue
+			}
+			log.Printf("create server: %v", err)
+			http.Error(w, "failed to create server", http.StatusInternalServerError)
+			return
+		}
+		if err != nil {
+			http.Error(w, "failed to create server", http.StatusInternalServerError)
+			return
+		}
+
+		response := serverPayload{
+			ID:        srvInfo.ID,
+			Slug:      srvInfo.Slug,
+			Name:      srvInfo.Name,
+			CreatedAt: srvInfo.CreatedAt,
+			Channels: []channelPayload{{
+				ID:        chInfo.ID,
+				ServerID:  chInfo.ServerID,
+				Slug:      chInfo.Slug,
+				Name:      chInfo.Name,
+				CreatedAt: chInfo.CreatedAt,
+				Type:      chInfo.Kind,
+			}},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			log.Printf("encode server response: %v", err)
+		}
+	default:
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *serverState) handleServerAPI(w http.ResponseWriter, r *http.Request) {
 	currentUser, ok := s.userFromRequest(r)
 	if !ok {
@@ -385,6 +459,7 @@ func (s *serverState) handleServerAPI(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "failed to list channels", http.StatusInternalServerError)
 				return
 			}
+
 			payload := make([]channelPayload, 0, len(channels))
 			for _, ch := range channels {
 				payload = append(payload, channelPayload{
@@ -393,17 +468,81 @@ func (s *serverState) handleServerAPI(w http.ResponseWriter, r *http.Request) {
 					Slug:      ch.Slug,
 					Name:      ch.Name,
 					CreatedAt: ch.CreatedAt,
-					Type:      "text",
+					Type:      ch.Kind,
 				})
 			}
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(payload); err != nil {
 				log.Printf("encode channels: %v", err)
 			}
+		case http.MethodPost:
+			var body struct {
+				Name string `json:"name"`
+				Kind string `json:"kind"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "invalid request body", http.StatusBadRequest)
+				return
+			}
+			body.Name = strings.TrimSpace(body.Name)
+			if body.Name == "" {
+				http.Error(w, "name is required", http.StatusBadRequest)
+				return
+			}
+			body.Kind = strings.ToLower(strings.TrimSpace(body.Kind))
+			if body.Kind == "" {
+				body.Kind = "text"
+			}
+			if body.Kind != "text" && body.Kind != "voice" {
+				http.Error(w, "kind must be 'text' or 'voice'", http.StatusBadRequest)
+				return
+			}
+
+			baseSlug := slugify(body.Name)
+			slug := baseSlug
+			ctx := r.Context()
+			var chInfo channelInfo
+			for attempt := 0; attempt < 8; attempt++ {
+				chInfo, err = s.createChannel(ctx, serverID, body.Name, slug, body.Kind)
+				if err == nil {
+					break
+				}
+				if strings.Contains(err.Error(), "UNIQUE constraint failed: channels.server_id, channels.slug") {
+					slug = baseSlug + "-" + generateSessionID()[:6]
+					continue
+				}
+				log.Printf("create channel: %v", err)
+				http.Error(w, "failed to create channel", http.StatusInternalServerError)
+				return
+			}
+			if err != nil {
+				http.Error(w, "failed to create channel", http.StatusInternalServerError)
+				return
+			}
+
+			response := channelPayload{
+				ID:        chInfo.ID,
+				ServerID:  chInfo.ServerID,
+				Slug:      chInfo.Slug,
+				Name:      chInfo.Name,
+				CreatedAt: chInfo.CreatedAt,
+				Type:      chInfo.Kind,
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			if err := json.NewEncoder(w).Encode(response); err != nil {
+				log.Printf("encode channel response: %v", err)
+			}
 		default:
-			w.Header().Set("Allow", "GET")
+			w.Header().Set("Allow", "GET, POST")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+		return
+	}
+
+	if len(parts) < 2 {
+		http.NotFound(w, r)
 		return
 	}
 
@@ -478,13 +617,13 @@ func (s *serverState) handleChannelAPI(w http.ResponseWriter, r *http.Request) {
 
 	switch parts[1] {
 	case "messages":
-		s.handleChannelMessages(w, r, channelID, currentUser)
+		s.handleChannelMessages(w, r, ch, currentUser)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-func (s *serverState) handleChannelMessages(w http.ResponseWriter, r *http.Request, channelID int64, currentUser user) {
+func (s *serverState) handleChannelMessages(w http.ResponseWriter, r *http.Request, ch channelInfo, currentUser user) {
 	switch r.Method {
 	case http.MethodGet:
 		limit := 50
@@ -497,7 +636,15 @@ func (s *serverState) handleChannelMessages(w http.ResponseWriter, r *http.Reque
 			}
 		}
 
-		messages, err := s.recentMessages(r.Context(), channelID, limit)
+		if ch.Kind != "text" {
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode([]messageDTO{}); err != nil {
+				log.Printf("encode voice messages: %v", err)
+			}
+			return
+		}
+
+		messages, err := s.recentMessages(r.Context(), ch.ID, limit)
 		if err != nil {
 			log.Printf("load messages: %v", err)
 			http.Error(w, "failed to load messages", http.StatusInternalServerError)
@@ -535,7 +682,12 @@ func (s *serverState) handleChannelMessages(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
-		msg, err := s.saveMessage(r.Context(), channelID, currentUser.Email, content)
+		if ch.Kind != "text" {
+			http.Error(w, "cannot send messages to a voice channel", http.StatusBadRequest)
+			return
+		}
+
+		msg, err := s.saveMessage(r.Context(), ch.ID, currentUser.Email, content)
 		if err != nil {
 			log.Printf("save message: %v", err)
 			http.Error(w, "failed to save message", http.StatusInternalServerError)
@@ -769,6 +921,28 @@ func envOrDefault(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+func slugify(input string) string {
+	input = strings.ToLower(strings.TrimSpace(input))
+	var b strings.Builder
+	lastDash := true
+	for _, r := range input {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	slug := strings.Trim(b.String(), "-")
+	if slug == "" {
+		slug = generateSessionID()[:8]
+	}
+	return slug
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {

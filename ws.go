@@ -25,7 +25,6 @@ var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		// Allow same-origin cookies; adjust if you introduce cross-origin usage.
 		return true
 	},
 }
@@ -36,7 +35,11 @@ type wsHub struct {
 }
 
 type voiceState struct {
-	mu           sync.RWMutex
+	mu    sync.RWMutex
+	rooms map[int64]*voiceRoom
+}
+
+type voiceRoom struct {
 	participants map[string]*wsClient
 }
 
@@ -64,8 +67,9 @@ type wsClient struct {
 	mu            sync.Mutex
 	closeOnce     sync.Once
 
-	voiceJoined bool
-	voiceID     string
+	voiceJoined    bool
+	voiceID        string
+	voiceChannelID int64
 }
 
 type wsInbound struct {
@@ -89,15 +93,11 @@ type wsOutbound struct {
 }
 
 func newWSHub() *wsHub {
-	return &wsHub{
-		channelSubs: make(map[int64]map[*wsClient]struct{}),
-	}
+	return &wsHub{channelSubs: make(map[int64]map[*wsClient]struct{})}
 }
 
 func newVoiceState() *voiceState {
-	return &voiceState{
-		participants: make(map[string]*wsClient),
-	}
+	return &voiceState{rooms: make(map[int64]*voiceRoom)}
 }
 
 func (h *wsHub) subscribe(client *wsClient, channelID int64) {
@@ -147,6 +147,160 @@ func (h *wsHub) broadcast(channelID int64, payload []byte) {
 	for _, client := range clients {
 		client.enqueue(payload)
 	}
+}
+
+func (s *serverState) voiceJoin(channelID int64, client *wsClient) ([]voiceParticipant, voiceParticipant, error) {
+	s.voice.mu.Lock()
+	defer s.voice.mu.Unlock()
+
+	if client.voiceJoined && client.voiceChannelID != 0 && client.voiceChannelID != channelID {
+		s.voiceLeaveLocked(client.voiceChannelID, client)
+	}
+
+	room := s.voice.rooms[channelID]
+	if room == nil {
+		room = &voiceRoom{participants: make(map[string]*wsClient)}
+		s.voice.rooms[channelID] = room
+	}
+
+	if client.voiceID == "" {
+		client.voiceID = generateSessionID()
+	}
+	client.voiceJoined = true
+	client.voiceChannelID = channelID
+	room.participants[client.voiceID] = client
+
+	participants := make([]voiceParticipant, 0, len(room.participants)-1)
+	for id, other := range room.participants {
+		if other == client {
+			continue
+		}
+		participants = append(participants, voiceParticipant{
+			ID:          id,
+			Email:       other.user.Email,
+			DisplayName: other.user.DisplayName,
+		})
+	}
+
+	self := voiceParticipant{
+		ID:          client.voiceID,
+		Email:       client.user.Email,
+		DisplayName: client.user.DisplayName,
+	}
+
+	return participants, self, nil
+}
+
+func (s *serverState) voiceLeave(channelID int64, client *wsClient) (voiceParticipant, bool) {
+	s.voice.mu.Lock()
+	defer s.voice.mu.Unlock()
+	return s.voiceLeaveLocked(channelID, client)
+}
+
+func (s *serverState) voiceLeaveLocked(channelID int64, client *wsClient) (voiceParticipant, bool) {
+	room := s.voice.rooms[channelID]
+	if room == nil {
+		client.voiceJoined = false
+		client.voiceChannelID = 0
+		client.voiceID = ""
+		return voiceParticipant{}, false
+	}
+
+	id := client.voiceID
+	if id == "" {
+		for candidateID, participant := range room.participants {
+			if participant == client {
+				id = candidateID
+				break
+			}
+		}
+	}
+	if id == "" {
+		return voiceParticipant{}, false
+	}
+
+	part := voiceParticipant{ID: id, Email: client.user.Email, DisplayName: client.user.DisplayName}
+	delete(room.participants, id)
+	client.voiceJoined = false
+	client.voiceChannelID = 0
+	client.voiceID = ""
+
+	if len(room.participants) == 0 {
+		delete(s.voice.rooms, channelID)
+	}
+	return part, true
+}
+
+func (s *serverState) voiceParticipants(channelID int64, exclude *wsClient) []voiceParticipant {
+	s.voice.mu.RLock()
+	defer s.voice.mu.RUnlock()
+	room := s.voice.rooms[channelID]
+	if room == nil {
+		return nil
+	}
+	participants := make([]voiceParticipant, 0, len(room.participants))
+	for id, client := range room.participants {
+		if exclude != nil && client == exclude {
+			continue
+		}
+		participants = append(participants, voiceParticipant{
+			ID:          id,
+			Email:       client.user.Email,
+			DisplayName: client.user.DisplayName,
+		})
+	}
+	return participants
+}
+
+func (s *serverState) voiceBroadcast(channelID int64, outbound wsOutbound, exclude *wsClient) {
+	payload, err := json.Marshal(outbound)
+	if err != nil {
+		log.Printf("marshal voice broadcast: %v", err)
+		return
+	}
+
+	s.voice.mu.RLock()
+	room := s.voice.rooms[channelID]
+	if room != nil {
+		for _, client := range room.participants {
+			if exclude != nil && client == exclude {
+				continue
+			}
+			client.enqueue(append([]byte(nil), payload...))
+		}
+	}
+	s.voice.mu.RUnlock()
+}
+
+var errVoiceTargetMissing = errors.New("voice target missing")
+var errVoiceNotInRoom = errors.New("voice sender not in room")
+
+func (s *serverState) voiceSignal(channelID int64, sender *wsClient, targetID string, payload json.RawMessage) error {
+	s.voice.mu.RLock()
+	room := s.voice.rooms[channelID]
+	if room == nil {
+		s.voice.mu.RUnlock()
+		return errVoiceNotInRoom
+	}
+	target, ok := room.participants[targetID]
+	if !ok {
+		s.voice.mu.RUnlock()
+		return errVoiceTargetMissing
+	}
+	s.voice.mu.RUnlock()
+
+	signal := wsOutbound{
+		Type:      "voice:signal",
+		ChannelID: channelID,
+		Signal: &voiceSignal{
+			From:        sender.voiceID,
+			Email:       sender.user.Email,
+			DisplayName: sender.user.DisplayName,
+			Payload:     payload,
+		},
+	}
+	target.enqueueJSON(signal)
+	return nil
 }
 
 func (c *wsClient) readLoop() {
@@ -206,11 +360,11 @@ func (c *wsClient) handleEvent(evt wsInbound) {
 	case "message":
 		c.handleMessage(evt.ChannelID, evt.Content)
 	case "voice:join":
-		c.handleVoiceJoin()
+		c.handleVoiceJoin(evt.ChannelID)
 	case "voice:leave":
-		c.handleVoiceLeave()
+		c.handleVoiceLeave(evt.ChannelID)
 	case "voice:signal":
-		c.handleVoiceSignal(evt.Target, evt.Payload)
+		c.handleVoiceSignal(evt.ChannelID, evt.Target, evt.Payload)
 	default:
 		c.sendError("unsupported_event", "unsupported event type")
 	}
@@ -296,38 +450,72 @@ func (c *wsClient) handleMessage(channelID int64, content string) {
 	c.state.broadcastMessage(dto)
 }
 
-func (c *wsClient) handleVoiceJoin() {
-	if c.voiceJoined {
-		participants := c.state.voiceSnapshot(c)
-		self := c.voiceParticipant()
-		c.enqueueJSON(wsOutbound{Type: "voice:participants", Participants: participants, Self: &self})
+func (c *wsClient) handleVoiceJoin(channelID int64) {
+	if channelID <= 0 {
+		c.sendError("voice_invalid", "channel id required")
 		return
 	}
 
-	participants, self := c.state.voiceRegister(c)
-	c.enqueueJSON(wsOutbound{Type: "voice:participants", Participants: participants, Self: &self})
-	c.state.voiceNotifyJoin(self, c)
+	ch, exists, err := c.state.channelByID(context.Background(), channelID)
+	if err != nil {
+		c.sendError("internal", "failed to load channel")
+		return
+	}
+	if !exists || ch.Kind != "voice" {
+		c.sendError("voice_invalid", "not a voice channel")
+		return
+	}
+
+	hasAccess, err := c.state.userHasServerAccess(context.Background(), c.user.Email, ch.ServerID)
+	if err != nil {
+		c.sendError("internal", "permission check failed")
+		return
+	}
+	if !hasAccess {
+		c.sendError("forbidden", "no access to voice channel")
+		return
+	}
+
+	participants, self, err := c.state.voiceJoin(channelID, c)
+	if err != nil {
+		log.Printf("voice join: %v", err)
+		c.sendError("internal", "failed to join voice")
+		return
+	}
+
+	outbound := wsOutbound{Type: "voice:participants", ChannelID: channelID, Participants: participants, Self: &self}
+	c.enqueueJSON(outbound)
+	c.state.voiceBroadcast(channelID, wsOutbound{Type: "voice:peer-joined", ChannelID: channelID, Peer: &self}, c)
 }
 
-func (c *wsClient) handleVoiceLeave() {
-	participant, removed := c.state.voiceUnregister(c)
+func (c *wsClient) handleVoiceLeave(channelID int64) {
+	if channelID == 0 {
+		channelID = c.voiceChannelID
+	}
+	if channelID == 0 {
+		return
+	}
+	participant, removed := c.state.voiceLeave(channelID, c)
 	if removed {
-		c.state.voiceNotifyLeave(participant, c)
+		c.state.voiceBroadcast(channelID, wsOutbound{Type: "voice:peer-left", ChannelID: channelID, Peer: &participant}, c)
 	}
 }
 
-func (c *wsClient) handleVoiceSignal(target string, payload json.RawMessage) {
-	if !c.voiceJoined || c.voiceID == "" {
-		c.sendError("voice_not_joined", "join voice before sending media")
+func (c *wsClient) handleVoiceSignal(channelID int64, target string, payload json.RawMessage) {
+	if channelID == 0 {
+		channelID = c.voiceChannelID
+	}
+	if !c.voiceJoined || channelID == 0 || c.voiceChannelID != channelID {
+		c.sendError("voice_not_joined", "join voice before signaling")
 		return
 	}
 	if target == "" || len(payload) == 0 {
-		c.sendError("voice_invalid", "signal target and payload required")
+		c.sendError("voice_invalid", "signal requires target")
 		return
 	}
-	if err := c.state.voiceSignal(c, target, payload); err != nil {
+	if err := c.state.voiceSignal(channelID, c, target, payload); err != nil {
 		if errors.Is(err, errVoiceTargetMissing) {
-			c.sendError("voice_target_missing", "target not available")
+			c.sendError("voice_target_missing", "target not found")
 		} else {
 			log.Printf("voice signal: %v", err)
 			c.sendError("internal", "failed to forward signal")
@@ -365,7 +553,13 @@ func (c *wsClient) enqueueJSON(v any) {
 
 func (c *wsClient) close() {
 	c.closeOnce.Do(func() {
-		c.state.voiceUnregister(c)
+		if c.voiceChannelID != 0 {
+			participant, removed := c.state.voiceLeave(c.voiceChannelID, c)
+			if removed {
+				c.state.voiceBroadcast(c.voiceChannelID, wsOutbound{Type: "voice:peer-left", ChannelID: c.voiceChannelID, Peer: &participant}, c)
+			}
+		}
+
 		c.hub.removeClient(c)
 
 		c.mu.Lock()
@@ -420,116 +614,6 @@ func (s *serverState) broadcastMessage(msg messageDTO) {
 		return
 	}
 	s.ws.broadcast(msg.ChannelID, payload)
-}
-
-var errVoiceTargetMissing = errors.New("voice target missing")
-
-func (s *serverState) voiceRegister(client *wsClient) ([]voiceParticipant, voiceParticipant) {
-	s.voice.mu.Lock()
-	defer s.voice.mu.Unlock()
-
-	if client.voiceJoined && client.voiceID != "" {
-		participants := make([]voiceParticipant, 0, len(s.voice.participants))
-		for _, other := range s.voice.participants {
-			if other == client {
-				continue
-			}
-			participants = append(participants, other.voiceParticipant())
-		}
-		return participants, client.voiceParticipant()
-	}
-
-	if client.voiceID == "" {
-		client.voiceID = generateSessionID()
-	}
-	client.voiceJoined = true
-
-	participants := make([]voiceParticipant, 0, len(s.voice.participants))
-	for _, other := range s.voice.participants {
-		participants = append(participants, other.voiceParticipant())
-	}
-
-	s.voice.participants[client.voiceID] = client
-
-	return participants, client.voiceParticipant()
-}
-
-func (s *serverState) voiceUnregister(client *wsClient) (voiceParticipant, bool) {
-	s.voice.mu.Lock()
-	defer s.voice.mu.Unlock()
-
-	if !client.voiceJoined || client.voiceID == "" {
-		return voiceParticipant{}, false
-	}
-
-	part := client.voiceParticipant()
-	delete(s.voice.participants, client.voiceID)
-	client.voiceJoined = false
-	client.voiceID = ""
-	return part, true
-}
-
-func (s *serverState) voiceSnapshot(exclude *wsClient) []voiceParticipant {
-	s.voice.mu.RLock()
-	defer s.voice.mu.RUnlock()
-	participants := make([]voiceParticipant, 0, len(s.voice.participants))
-	for _, other := range s.voice.participants {
-		if other == exclude {
-			continue
-		}
-		participants = append(participants, other.voiceParticipant())
-	}
-	return participants
-}
-
-func (s *serverState) voiceNotifyJoin(part voiceParticipant, exclude *wsClient) {
-	outbound := wsOutbound{Type: "voice:peer-joined", Peer: &part}
-	s.voiceBroadcast(outbound, exclude)
-}
-
-func (s *serverState) voiceNotifyLeave(part voiceParticipant, exclude *wsClient) {
-	outbound := wsOutbound{Type: "voice:peer-left", Peer: &part}
-	s.voiceBroadcast(outbound, exclude)
-}
-
-func (s *serverState) voiceSignal(sender *wsClient, targetID string, payload json.RawMessage) error {
-	s.voice.mu.RLock()
-	target, ok := s.voice.participants[targetID]
-	s.voice.mu.RUnlock()
-	if !ok {
-		return errVoiceTargetMissing
-	}
-
-	signal := wsOutbound{Type: "voice:signal", Signal: &voiceSignal{
-		From:        sender.voiceID,
-		Email:       sender.user.Email,
-		DisplayName: sender.user.DisplayName,
-		Payload:     payload,
-	}}
-	target.enqueueJSON(signal)
-	return nil
-}
-
-func (s *serverState) voiceBroadcast(outbound wsOutbound, exclude *wsClient) {
-	payload, err := json.Marshal(outbound)
-	if err != nil {
-		log.Printf("marshal voice broadcast: %v", err)
-		return
-	}
-
-	s.voice.mu.RLock()
-	clients := make([]*wsClient, 0, len(s.voice.participants))
-	for _, client := range s.voice.participants {
-		if exclude != nil && client == exclude {
-			continue
-		}
-		clients = append(clients, client)
-	}
-	s.voice.mu.RUnlock()
-
-	for _, client := range clients {
-		client.enqueue(append([]byte(nil), payload...))
-	}
 }
 
 func (c *wsClient) voiceParticipant() voiceParticipant {

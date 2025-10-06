@@ -59,16 +59,7 @@ body {
   align-items: center;
 }
 
-.server-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  width: 100%;
-  align-items: center;
-}
+.server-list {\n  list-style: none;\n  padding: 0;\n  margin: 0;\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n  width: 100%;\n  align-items: center;\n  flex: 1;\n}
 
 .server-item {
   width: 56px;
@@ -525,4 +516,61 @@ body {
 
 .voice-audio-container audio {
   display: none;
+}
+
+.server-add {
+  margin-top: auto;
+  margin-bottom: 12px;
+  width: 56px;
+  padding: 12px 10px;
+  border-radius: 18px;
+  border: 1px dashed rgba(148, 163, 184, 0.4);
+  background: transparent;
+  color: rgba(248, 250, 252, 0.8);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.server-add:hover {
+  background: rgba(56, 189, 248, 0.2);
+  color: var(--bg-0);
+}
+
+.channel-add {
+  margin: 0 16px 12px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  background: transparent;
+  color: rgba(248, 250, 252, 0.75);
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.channel-add:hover {
+  background: rgba(56, 189, 248, 0.18);
+  color: var(--bg-0);
+}
+
+.voice-button:disabled {
+  background: rgba(148, 163, 184, 0.15);
+  color: rgba(148, 163, 184, 0.6);
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.channel-item.is-voice .hash {
+  color: var(--accent);
+}
+
+.channel-item.is-voice .channel-button {
+  color: var(--text-0);
 }

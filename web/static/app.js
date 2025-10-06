@@ -20,6 +20,8 @@ const state = {
   wsReconnectDelay: 2000,
   voice: {
     joined: false,
+    channelId: null,
+    currentChannelId: null,
     selfId: null,
     localStream: null,
     peers: new Map(),
@@ -33,7 +35,9 @@ const refs = {
   memberList: null,
   messageList: null,
   messageWrapper: null,
+  composerForm: null,
   composerInput: null,
+  composerSubmit: null,
   status: null,
   headerTitle: null,
   channelBreadcrumb: null,
@@ -125,6 +129,15 @@ function findServer(serverId) {
   return state.servers.find((srv) => srv.id === serverId);
 }
 
+function getChannel(channelId) {
+  if (!channelId) return null;
+  for (const server of state.servers) {
+    const channel = (server.channels || []).find((ch) => ch.id === channelId);
+    if (channel) return channel;
+  }
+  return null;
+}
+
 function ensureChannelBuffer(channelId) {
   if (!state.messagesByChannel.has(channelId)) {
     state.messagesByChannel.set(channelId, []);
@@ -170,6 +183,15 @@ function createServerNav() {
   refs.serverList = document.createElement('ul');
   refs.serverList.className = 'server-list';
   nav.appendChild(refs.serverList);
+
+  const addButton = document.createElement('button');
+  addButton.type = 'button';
+  addButton.className = 'server-add';
+  addButton.textContent = '+';
+  addButton.title = 'Create Server';
+  addButton.addEventListener('click', promptCreateServer);
+  nav.appendChild(addButton);
+
   return nav;
 }
 
@@ -189,6 +211,13 @@ function createChannelPanel() {
   refs.channelList = document.createElement('ul');
   refs.channelList.className = 'channel-list';
   aside.appendChild(refs.channelList);
+
+  const addButton = document.createElement('button');
+  addButton.type = 'button';
+  addButton.className = 'channel-add';
+  addButton.textContent = '+ Add Channel';
+  addButton.addEventListener('click', promptCreateChannel);
+  aside.appendChild(addButton);
   return aside;
 }
 
@@ -303,7 +332,9 @@ function createChatPanel() {
 
   composer.addEventListener('submit', handleSubmit);
 
+  refs.composerForm = composer;
   refs.composerInput = textarea;
+  refs.composerSubmit = button;
   main.appendChild(composer);
   return main;
 }
@@ -363,6 +394,9 @@ function renderChannels() {
   server.channels.forEach((channel) => {
     const item = document.createElement('li');
     item.className = 'channel-item';
+    if (channel.type === 'voice') {
+      item.classList.add('is-voice');
+    }
     if (channel.id === state.activeChannelId) {
       item.classList.add('is-active');
     }
@@ -370,7 +404,11 @@ function renderChannels() {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'channel-button';
-    button.innerHTML = `<span class="hash">#</span><span>${channel.name}</span>`;
+    if (channel.type === 'voice') {
+      button.innerHTML = `<span class="hash">??</span><span>${channel.name}</span>`;
+    } else {
+      button.innerHTML = `<span class="hash">#</span><span>${channel.name}</span>`;
+    }
     button.addEventListener('click', () => switchChannel(channel.id));
 
     const unreadCount = server.unread.get(channel.id) || 0;
@@ -528,19 +566,60 @@ async function switchChannel(channelId) {
   setStatus('');
 }
 
-function updateComposerPlaceholder() {
-  if (!refs.composerInput) return;
+function updateChannelUI() {
   const server = findServer(state.activeServerId);
-  const channel = server ? server.channels.find((ch) => ch.id === state.activeChannelId) : null;
-  const name = channel ? channel.name : 'channel';
-  refs.composerInput.placeholder = `Message #${name}`;
+  const channel = getChannel(state.activeChannelId);
+  const channelId = channel ? channel.id : null;
+  const isVoice = channel && channel.type === 'voice';
+
+  state.voice.currentChannelId = isVoice ? channelId : null;
+
+  if (refs.channelBreadcrumb) {
+    if (server && channel) {
+      const prefix = channel.type === 'voice' ? '?? ' : '#';
+      refs.channelBreadcrumb.textContent = `${server.name} / ${prefix}${channel.name}`;
+    } else {
+      refs.channelBreadcrumb.textContent = '';
+    }
+  }
+
+  if (refs.composerInput) {
+    refs.composerInput.disabled = !channel || isVoice;
+    if (!channel) {
+      refs.composerInput.placeholder = 'Message';
+    } else if (isVoice) {
+      refs.composerInput.placeholder = 'Voice channel selected';
+    } else {
+      refs.composerInput.placeholder = `Message #${channel.name}`;
+    }
+  }
+  if (refs.composerSubmit) {
+    refs.composerSubmit.disabled = !channel || isVoice;
+  }
+
+  if (!isVoice && state.voice.joined && state.voice.channelId && state.voice.channelId !== channelId) {
+    leaveVoice();
+  }
+
+  if (isVoice) {
+    if (state.voice.joined && state.voice.channelId === channel.id) {
+      setStatus('Voice connected.', '');
+    } else {
+      setStatus('Voice channel selected. Click Join Voice to connect.', '');
+    }
+  } else if (!state.voice.joined) {
+    setStatus('');
+  }
+
+  updateVoiceUI();
 }
 
 function updateBreadcrumb() {
-  if (!refs.channelBreadcrumb) return;
-  const server = findServer(state.activeServerId);
-  const channel = server ? server.channels.find((ch) => ch.id === state.activeChannelId) : null;
-  refs.channelBreadcrumb.textContent = server && channel ? `${server.name} / #${channel.name}` : '';
+  updateChannelUI();
+}
+
+function updateComposerPlaceholder() {
+  updateChannelUI();
 }
 
 async function ensureMembersLoaded(serverId) {
@@ -620,7 +699,18 @@ function subscribeAllChannels() {
 
 function updateVoiceUI(statusText = '') {
   if (!refs.voiceButton || !refs.voiceStatus) return;
-  if (state.voice.joined) {
+  const channelId = state.voice.currentChannelId;
+  const channel = getChannel(channelId);
+  if (!channel || channel.type !== 'voice') {
+    refs.voiceButton.disabled = true;
+    refs.voiceButton.className = 'voice-button';
+    refs.voiceButton.textContent = 'Join Voice';
+    refs.voiceStatus.textContent = 'Select a voice channel';
+    return;
+  }
+
+  refs.voiceButton.disabled = false;
+  if (state.voice.joined && state.voice.channelId === channelId) {
     refs.voiceButton.textContent = 'Leave Voice';
     refs.voiceButton.classList.add('is-active');
     refs.voiceStatus.textContent = statusText || 'Live';
@@ -661,7 +751,14 @@ function removeAudioElement(el) {
 }
 
 async function joinVoice() {
-  if (state.voice.joined) return;
+  const targetChannelId = state.voice.currentChannelId;
+  if (!targetChannelId) {
+    setStatus('Select a voice channel first.', 'error');
+    return;
+  }
+  if (state.voice.joined && state.voice.channelId === targetChannelId) {
+    return;
+  }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     setStatus('Voice is not supported in this browser.', 'error');
     return;
@@ -669,11 +766,12 @@ async function joinVoice() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     state.voice.localStream = stream;
-    state.voice.joined = true;
     state.voice.peers = new Map();
+    state.voice.joined = true;
+    state.voice.channelId = targetChannelId;
     attachLocalStream(stream);
-    updateVoiceUI('Connecting…');
-    sendSocketEvent({ type: 'voice:join' });
+    updateVoiceUI('Connecting...');
+    sendSocketEvent({ type: 'voice:join', channelId: targetChannelId });
   } catch (error) {
     console.error('voice join', error);
     setStatus('Microphone permission denied.', 'error');
@@ -698,24 +796,19 @@ function cleanupVoicePeers() {
   state.voice.peers.clear();
 }
 
-function stopLocalStream() {
-  if (!state.voice.localStream) return;
-  state.voice.localStream.getTracks().forEach((track) => track.stop());
-  state.voice.localStream = null;
-  const localAudio = refs.voiceContainer && refs.voiceContainer.querySelector('audio[data-local="true"]');
-  removeAudioElement(localAudio);
-}
-
 function leaveVoice() {
   if (!state.voice.joined) return;
-  sendSocketEvent({ type: 'voice:leave' });
+  const channelId = state.voice.channelId || state.voice.currentChannelId;
+  if (channelId) {
+    sendSocketEvent({ type: 'voice:leave', channelId });
+  }
   cleanupVoicePeers();
   stopLocalStream();
   state.voice.joined = false;
+  state.voice.channelId = null;
   state.voice.selfId = null;
   updateVoiceUI();
 }
-
 function ensureVoicePeer(participant, initiator = false) {
   if (!participant || !participant.id || participant.id === state.voice.selfId) {
     return null;
@@ -752,6 +845,7 @@ function ensureVoicePeer(participant, initiator = false) {
     if (event.candidate) {
       sendSocketEvent({
         type: 'voice:signal',
+        channelId: state.voice.channelId,
         target: participant.id,
         payload: {
           kind: 'candidate',
@@ -795,6 +889,7 @@ async function createOffer(peer) {
   await peer.pc.setLocalDescription(offer);
   sendSocketEvent({
     type: 'voice:signal',
+    channelId: state.voice.channelId,
     target: peer.id,
     payload: {
       kind: 'sdp',
@@ -822,29 +917,31 @@ function removeVoicePeer(peerId) {
 }
 
 function handleVoiceParticipants(data) {
-  if (!state.voice.joined) return;
+  if (!data || data.channelId !== state.voice.currentChannelId) return;
   const { participants = [], self } = data;
-  if (self) {
-    state.voice.selfId = self.id;
-  }
+  cleanupVoicePeers();
+  state.voice.peers = new Map();
+  state.voice.channelId = data.channelId;
+  state.voice.joined = true;
+  state.voice.selfId = self ? self.id : null;
   participants.forEach((participant) => {
     ensureVoicePeer(participant, true);
   });
   updateVoiceUI('Live');
 }
 
-function handleVoicePeerJoined(participant) {
-  if (!state.voice.joined) return;
+function handleVoicePeerJoined(channelId, participant) {
+  if (!participant || channelId !== state.voice.channelId || !state.voice.joined) return;
   ensureVoicePeer(participant, false);
 }
 
-function handleVoicePeerLeft(participant) {
-  if (!participant) return;
+function handleVoicePeerLeft(channelId, participant) {
+  if (!participant || channelId !== state.voice.channelId) return;
   removeVoicePeer(participant.id);
 }
 
-async function handleVoiceSignal(signal) {
-  if (!signal || !state.voice.joined) return;
+async function handleVoiceSignal(channelId, signal) {
+  if (!signal || !state.voice.joined || channelId !== state.voice.channelId) return;
   const { from, payload, displayName, email } = signal;
   if (!from || !payload) return;
 
@@ -862,6 +959,7 @@ async function handleVoiceSignal(signal) {
       await peer.pc.setLocalDescription(answer);
       sendSocketEvent({
         type: 'voice:signal',
+        channelId: state.voice.channelId,
         target: from,
         payload: {
           kind: 'sdp',
@@ -896,13 +994,13 @@ function handleSocketMessage(event) {
         handleVoiceParticipants(data);
         break;
       case 'voice:peer-joined':
-        handleVoicePeerJoined(data.peer);
+        handleVoicePeerJoined(data.channelId, data.peer);
         break;
       case 'voice:peer-left':
-        handleVoicePeerLeft(data.peer);
+        handleVoicePeerLeft(data.channelId, data.peer);
         break;
       case 'voice:signal':
-        handleVoiceSignal(data.signal);
+        handleVoiceSignal(data.channelId, data.signal);
         break;
       default:
         break;
@@ -947,8 +1045,11 @@ function connectSocket() {
     setStatus('');
     subscribeAllChannels();
     flushPendingEvents();
-    if (state.voice.joined) {
-      sendSocketEvent({ type: 'voice:join' });
+    if (state.voice.channelId) {
+      const channelId = state.voice.channelId;
+      state.voice.joined = false;
+      sendSocketEvent({ type: 'voice:join', channelId });
+      updateVoiceUI('Reconnecting...');
     }
   });
 
@@ -1058,6 +1159,71 @@ async function bootstrapLatest() {
     console.error('bootstrap refresh', error);
   }
 }
+
+async function promptCreateServer() {
+  if (!state.routes.servers) {
+    return;
+  }
+  const name = window.prompt('Server name');
+  if (!name) {
+    return;
+  }
+  try {
+    const payload = await fetchJSON(state.routes.servers, {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    });
+    const server = {
+      ...payload,
+      unread: new Map(),
+    };
+    state.servers.push(server);
+    state.membersByServer.delete(server.id);
+    renderServers();
+    await switchServer(server.id);
+  } catch (error) {
+    console.error('create server', error);
+    setStatus('Failed to create server.', 'error');
+  }
+}
+
+async function promptCreateChannel() {
+  const server = findServer(state.activeServerId);
+  if (!server) {
+    setStatus('Select a server first.', 'error');
+    return;
+  }
+  const name = window.prompt('Channel name');
+  if (!name) {
+    return;
+  }
+  let kindInput = window.prompt('Channel type (text/voice)', 'text');
+  let kind = (kindInput || 'text').trim().toLowerCase();
+  if (kind !== 'voice') {
+    kind = 'text';
+  }
+  try {
+    const payload = await fetchJSON(`${state.routes.servers}/${server.id}`, {
+      method: 'POST',
+      body: JSON.stringify({ name, kind }),
+    });
+    server.channels = server.channels || [];
+    server.channels.push(payload);
+    renderChannels();
+    sendSocketEvent({ type: 'subscribe', channelId: payload.id });
+    if (payload.type === 'text') {
+      state.messagesByChannel.set(payload.id, []);
+      await switchChannel(payload.id);
+    } else {
+      await switchChannel(payload.id);
+      setStatus('Voice channel created. Click Join Voice to connect.', '');
+    }
+  } catch (error) {
+    console.error('create channel', error);
+    setStatus('Failed to create channel.', 'error');
+  }
+}
+
 
 function renderApp() {
   const root = document.getElementById('app');
